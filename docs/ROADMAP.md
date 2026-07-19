@@ -7,28 +7,32 @@ flowchart LR
     P0["Phase 0\n🧪 Spike"] --> P1["Phase 1\n📦 sandbar-desktop"] --> P2["Phase 2\n🎛️ Platform"] --> P3["Phase 3\n🌍 Community"] --> P4["Phase 4\n🛡️ Hardening"]
 ```
 
-## Phase 0 — Spike (in progress)
+## Phase 0 — Spike ✅ (2026-07-19, amd64)
 
 Prove every risky assumption in one throwaway image before building anything real.
 
-- [ ] Hermes installs and runs on a Debian 13 Selkies base image
-- [ ] Hermes computer-use (AT-SPI/XTest) works against the Selkies X server — clicks real XFCE apps
-- [ ] Hermes TUI runs under ttyd with an auto-greeting
-- [ ] Exec-approval behavior understood and configured for an isolated container
-- [ ] RAM/CPU envelope measured (idle + agent actively browsing)
-- [ ] Same image builds and runs on arm64
+- [x] Hermes installs and runs on a Debian 13 Selkies base image
+- [x] Hermes computer-use works against the Selkies X server — screenshots + AT-SPI green; GUI input via xdotool/XTest (cua-driver's Linux background-input limitation documented in [`spike/README.md`](../spike/README.md))
+- [x] Hermes TUI runs under ttyd
+- [x] Exec-approval behavior: headless runs execute without prompts; deliberate review still open (Phase 1)
+- [x] RAM/CPU envelope measured (~720MiB / ~3% CPU idle)
+- [ ] Same image builds and runs on arm64 → moved to Phase 1 CI
 
-## Phase 1 — `sandbar-desktop` (Tier 0)
+## Phase 1 — `sandbar-desktop` (Tier 0) — in progress
 
 The one-command agent computer.
 
 - [ ] Multi-arch image (amd64 + arm64) published to GHCR, built on native runners
 - [ ] Hermes pinned by release tag; bump PRs are deliberate and tested
-- [ ] Agent adapter contract: `hermes` and `none` adapters
+- [x] First-run onboarding: no baked keys — native Hermes wizard in the chat pane; env keys skip it
+- [x] Agent runs inside the desktop session (session user + session D-Bus), verified end-to-end: agent opened a terminal and typed into it
+- [x] `sandbar-desktop` skill seeded (GUI control via shell + xdotool)
+- [ ] Agent adapter contract: `hermes` and `none` adapters formalized
 - [ ] Non-root agent user; Chromium without `--no-sandbox`
 - [ ] Control API (screenshot / click / type / key / scroll / bash / health / info)
-- [ ] Two-pane window: live desktop + agent chat
+- [ ] Two-pane window: live desktop + agent chat in one page
 - [ ] Raspberry Pi guide (shm-size, SSD, LXQt lite variant)
+- [ ] Exec-approval model reviewed and documented for isolated containers
 
 ## Phase 2 — Platform (Tier 1)
 

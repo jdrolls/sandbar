@@ -1,0 +1,12 @@
+#!/usr/bin/with-contenv bash
+# Start only after Webtop's X server and XFCE session are ready (spike finding 1).
+set -e
+
+# xdotool is installed by this image; unlike xdpyinfo it is guaranteed to exist here.
+until DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 \
+  && pgrep -u abc xfce4-session >/dev/null 2>&1; do
+  sleep 1
+done
+
+# ttyd stays root-owned; each connected terminal is explicitly dropped to abc.
+exec ttyd -p 7681 -W s6-setuidgid abc /usr/local/bin/sandbar-session.sh

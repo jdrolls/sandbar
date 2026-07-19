@@ -1,0 +1,11 @@
+#!/usr/bin/with-contenv bash
+# Seed built-in skills once without overwriting skills already persisted in /config.
+set -e
+
+source_dir=/etc/sandbar/skills
+skills_dir=/config/.hermes/skills
+if [ ! -d "$skills_dir/sandbar-desktop" ]; then
+  mkdir -p "$skills_dir"
+  cp -a "$source_dir/sandbar-desktop" "$skills_dir/"
+fi
+chown -R abc:abc "$skills_dir"

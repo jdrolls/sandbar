@@ -38,19 +38,22 @@ Sandbar is a **self-hosted AI agent computer**: an isolated Linux desktop in a D
 
 ## Quick start
 
-> ⚠️ **Status: v2 is being built in public right now.** The commands below are the contract we're building to — see the [roadmap](docs/ROADMAP.md) for where we are. Star/watch to follow along.
+> 🔨 **Status: v2 is being built in public.** The single-container image below **works today** (see [`desktop/`](desktop/)); the platform tier is next — see the [roadmap](docs/ROADMAP.md). Star/watch to follow along.
 
 **One computer, one command:**
 
 ```bash
 docker run -d --name sandbar \
-  -p 3000:3000 \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
+  -p 3000:3000 -p 3001:3001 -p 7681:7681 \
+  -v sandbar-config:/config \
   --shm-size=1g \
   ghcr.io/jdrolls/sandbar-desktop:latest
 ```
 
-Open `http://localhost:3000`. That's it — the agent greets you in the chat pane, the desktop is live next to it.
+Then open:
+
+- **Desktop** — `http://localhost:3000` (or `https://<host>:3001` from another machine; the desktop stream needs a secure context, so remote plain-HTTP won't render)
+- **Agent chat** — `http://localhost:7681` — first run walks you through connecting a provider (Nous Portal OAuth, Anthropic, OpenAI, OpenRouter, local models…). No key baked in, ever. Passing `-e ANTHROPIC_API_KEY=...` (or any provider key) skips onboarding.
 
 **The full platform (provision many computers, API, MCP):**
 

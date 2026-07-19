@@ -1,5 +1,7 @@
 # Phase 0 Spike
 
+> **Phase 0 is complete** — findings below are baked into the real image at [`desktop/`](../desktop/). This directory stays as the historical record.
+
 A throwaway image that answers the risky questions before we build the real `sandbar-desktop`. Nothing here is final; everything here is allowed to be ugly.
 
 ## What we're proving
@@ -26,6 +28,7 @@ A throwaway image that answers the risky questions before we build the real `san
 7. **`cua-driver` installs to `~/.local/bin` (not on PATH)** — symlink into `/usr/local/bin` in the image.
 8. **Image additions needed:** `xz-utils at-spi2-core dbus-x11 xdotool wmctrl scrot` + ttyd binary + cua-driver + PATH fixes + `/config` volume for persistence.
 9. **Model plumbing:** `ANTHROPIC_API_KEY` env is picked up natively; OpenRouter works with `--provider openrouter -m <slug>` (slug without the extra `openrouter/` prefix).
+10. **Installer's own config template trips a warning** in the installed Hermes version (`Unknown top-level config key 'group_sessions_per_user'`). Cosmetic — TUI continues. Candidate fix: run `hermes migrate` during image build.
 
 ## Try it
 

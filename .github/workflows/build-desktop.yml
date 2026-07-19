@@ -1,0 +1,134 @@
+name: Build and publish desktop image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - desktop/**
+      - .github/workflows/build-desktop.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/jdrolls/sandbar-desktop
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      # Hermes downloads roughly 1-2 GB here; the first build per architecture takes about 10-15 minutes.
+      - name: Build and push ${{ matrix.arch }} image by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./desktop
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/jdrolls/sandbar-desktop,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=desktop-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=desktop-${{ matrix.arch }}
+
+      # The merge job consumes digest files so it can assemble one multi-architecture manifest.
+      - name: Export image digest
+        run: |
+          mkdir -p /tmp/digests
+          # upload-artifact rejects ':' in file paths, so store the digest without its sha256: prefix.
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create multi-architecture manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      # Tag the immutable per-architecture digests as one manifest list; no emulation is required.
+      - name: Create and verify multi-architecture manifest
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tags=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && tags+=(-t "$tag")
+          done <<< "$TAGS"
+
+          images=()
+          while IFS= read -r digest; do
+            # Filenames carry the digest without its sha256: prefix (see export step).
+            [ -n "$digest" ] && images+=("${IMAGE_NAME}@sha256:${digest}")
+          done < <(find /tmp/digests -type f -printf '%f\n')
+
+          [ "${#images[@]}" -eq 2 ]
+          docker buildx imagetools create "${tags[@]}" "${images[@]}"
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && docker buildx imagetools inspect "$tag"
+          done <<< "$TAGS"

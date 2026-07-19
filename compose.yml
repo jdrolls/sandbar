@@ -1,0 +1,14 @@
+services:
+  platform:
+    build: ./platform
+    ports:
+      - "9000:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sandbar-platform-data:/data
+    restart: unless-stopped
+    environment:
+      SANDBAR_IMAGE: ghcr.io/jdrolls/sandbar-desktop:latest
+
+volumes:
+  sandbar-platform-data:

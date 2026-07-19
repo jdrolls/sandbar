@@ -50,18 +50,15 @@ docker run -d --name sandbar \
   ghcr.io/jdrolls/sandbar-desktop:latest
 ```
 
-Then open:
+Add `-p 8080:8080` and open **`http://localhost:8080`** — the Sandbar Window: desktop and agent chat on one page. First run walks you through connecting a provider (Nous Portal OAuth, Anthropic, OpenAI, OpenRouter, local models…). **No key baked in, ever.** Passing `-e ANTHROPIC_API_KEY=...` (or any provider key) skips onboarding. See [`desktop/`](desktop/) for auth, adapters, and all the knobs.
 
-- **Desktop** — `http://localhost:3000` (or `https://<host>:3001` from another machine; the desktop stream needs a secure context, so remote plain-HTTP won't render)
-- **Agent chat** — `http://localhost:7681` — first run walks you through connecting a provider (Nous Portal OAuth, Anthropic, OpenAI, OpenRouter, local models…). No key baked in, ever. Passing `-e ANTHROPIC_API_KEY=...` (or any provider key) skips onboarding.
-
-**The full platform (provision many computers, API, MCP):**
+**The full platform (provision many computers from a dashboard, REST API, MCP):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jdrolls/sandbar/main/install.sh | bash
 ```
 
-The installer detects your architecture, sets up Docker if needed, generates secrets, and walks you through setup — then prints your URL. Private-by-default: the recommended access path is [Tailscale](https://tailscale.com) (zero open ports), with Cloudflare Tunnel and plain HTTPS as documented alternatives.
+The installer checks Docker, brings up the control plane, and prints your dashboard URL + access token. Create and destroy computers from the dashboard or the API; plug the [MCP server](platform/mcp/) into Claude Code (or any MCP client) to use your computers as native tools. Private-by-default: the recommended remote-access path is [Tailscale](https://tailscale.com) (zero open ports).
 
 ## How it works
 

@@ -22,7 +22,7 @@ Prove every risky assumption in one throwaway image before building anything rea
 
 The one-command agent computer.
 
-- [x] Multi-arch image (amd64 + arm64) published to GHCR, built on native runners — `docker run ghcr.io/jdrolls/sandbar-desktop:latest` verified boots to onboarding (amd64; arm64 runtime test pending hardware)
+- [x] Multi-arch image (amd64 + arm64) published to GHCR, built on native runners — `docker run ghcr.io/jdrolls/sandbar-desktop:latest` verified boots to onboarding (amd64 fully; arm64 boot verified under QEMU emulation — physical-Pi perf reports welcome)
 - [x] Desktop browser works out of the box (Chromium, flags preconfigured; container is the isolation boundary — Docker's default seccomp blocks the browser sandbox, custom seccomp re-enables it)
 - [x] Hermes pinned to the v0.18.2 release commit (installer `--commit` flag); bumps are deliberate ARG updates, rebuilt and retested
 - [x] First-run onboarding: no baked keys — native Hermes wizard in the chat pane; env keys skip it
@@ -39,12 +39,13 @@ The one-command agent computer.
 
 Provision many computers; keep it optional.
 
-- [ ] Bun/TS control plane: provisioning CRUD + embedded reverse proxy (no Docker socket in anything internet-facing)
-- [ ] Single-user token auth by default; signed short-lived route tokens on every surface
-- [ ] `install.sh` — arch detect, Docker bootstrap, secrets, guided first run
-- [ ] Tailscale-default access; Cloudflare Tunnel + Caddy/LE documented
-- [ ] MCP server — Sandbar computers as native tools in Claude Code and any MCP client
+- [x] Bun/TS control plane (`platform/`): provisioning CRUD + dashboard, zero runtime deps (Bun.serve + bun:sqlite + Docker Engine API over the socket). Design choice: **per-computer host-port blocks instead of path-rewriting proxies** — Selkies/ttyd under rewritten paths is the fragility v1 died of; direct ports compose cleanly with Tailscale/your own proxy
+- [x] Single-user token auth (generated at first run, printed once, stored in `/data/token`); per-computer control tokens minted at create time
+- [x] `install.sh` — arch detect, Docker check/bootstrap, compose up, health wait, token handoff
+- [x] MCP server (`platform/mcp/`) — list/create/delete computers + screenshot/bash/click/type/key as native tools; verified end-to-end from a real MCP handshake
+- [x] Private-by-default access documented throughout (Tailscale serve tips in every guide); Cloudflare Tunnel + Caddy/LE remain user's choice
 - [ ] Multi-user opt-in mode (accounts, per-user keys, admin)
+- [ ] Publish `ghcr.io/jdrolls/sandbar-platform` image (today: `compose up --build` from the repo)
 
 ## Phase 3 — Community
 

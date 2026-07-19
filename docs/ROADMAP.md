@@ -1,0 +1,55 @@
+# Roadmap
+
+> Building in public. Checkboxes update as things land — if it's checked, it's real and verified, not aspirational.
+
+```mermaid
+flowchart LR
+    P0["Phase 0\n🧪 Spike"] --> P1["Phase 1\n📦 sandbar-desktop"] --> P2["Phase 2\n🎛️ Platform"] --> P3["Phase 3\n🌍 Community"] --> P4["Phase 4\n🛡️ Hardening"]
+```
+
+## Phase 0 — Spike (in progress)
+
+Prove every risky assumption in one throwaway image before building anything real.
+
+- [ ] Hermes installs and runs on a Debian 13 Selkies base image
+- [ ] Hermes computer-use (AT-SPI/XTest) works against the Selkies X server — clicks real XFCE apps
+- [ ] Hermes TUI runs under ttyd with an auto-greeting
+- [ ] Exec-approval behavior understood and configured for an isolated container
+- [ ] RAM/CPU envelope measured (idle + agent actively browsing)
+- [ ] Same image builds and runs on arm64
+
+## Phase 1 — `sandbar-desktop` (Tier 0)
+
+The one-command agent computer.
+
+- [ ] Multi-arch image (amd64 + arm64) published to GHCR, built on native runners
+- [ ] Hermes pinned by release tag; bump PRs are deliberate and tested
+- [ ] Agent adapter contract: `hermes` and `none` adapters
+- [ ] Non-root agent user; Chromium without `--no-sandbox`
+- [ ] Control API (screenshot / click / type / key / scroll / bash / health / info)
+- [ ] Two-pane window: live desktop + agent chat
+- [ ] Raspberry Pi guide (shm-size, SSD, LXQt lite variant)
+
+## Phase 2 — Platform (Tier 1)
+
+Provision many computers; keep it optional.
+
+- [ ] Bun/TS control plane: provisioning CRUD + embedded reverse proxy (no Docker socket in anything internet-facing)
+- [ ] Single-user token auth by default; signed short-lived route tokens on every surface
+- [ ] `install.sh` — arch detect, Docker bootstrap, secrets, guided first run
+- [ ] Tailscale-default access; Cloudflare Tunnel + Caddy/LE documented
+- [ ] MCP server — Sandbar computers as native tools in Claude Code and any MCP client
+- [ ] Multi-user opt-in mode (accounts, per-user keys, admin)
+
+## Phase 3 — Community
+
+- [ ] `openclaw` containment adapter + migration guide
+- [ ] Takeover-mode polish (explicit human/agent control handoff in the UI)
+- [ ] Docs site
+- [ ] Launch write-ups: self-hosted agent computers, OpenClaw containment, agents on a Pi
+
+## Phase 4 — Hardening & fleet
+
+- [ ] sysbox opt-in runtime (Docker-in-desktop, real systemd)
+- [ ] gVisor "untrusted agent" tier
+- [ ] Computer templates & persistence/snapshot story

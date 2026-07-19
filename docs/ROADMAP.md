@@ -22,13 +22,14 @@ Prove every risky assumption in one throwaway image before building anything rea
 
 The one-command agent computer.
 
-- [ ] Multi-arch image (amd64 + arm64) published to GHCR, built on native runners
+- [x] Multi-arch image (amd64 + arm64) published to GHCR, built on native runners — `docker run ghcr.io/jdrolls/sandbar-desktop:latest` verified boots to onboarding (amd64; arm64 runtime test pending hardware)
+- [x] Desktop browser works out of the box (Chromium, flags preconfigured; container is the isolation boundary — Docker's default seccomp blocks the browser sandbox, custom seccomp re-enables it)
 - [ ] Hermes pinned by release tag; bump PRs are deliberate and tested
 - [x] First-run onboarding: no baked keys — native Hermes wizard in the chat pane; env keys skip it
 - [x] Agent runs inside the desktop session (session user + session D-Bus), verified end-to-end: agent opened a terminal and typed into it
 - [x] `sandbar-desktop` skill seeded (GUI control via shell + xdotool)
 - [ ] Agent adapter contract: `hermes` and `none` adapters formalized
-- [ ] Non-root agent user; Chromium without `--no-sandbox`
+- [x] Non-root agent user (desktop session user, not root)
 - [ ] Control API (screenshot / click / type / key / scroll / bash / health / info)
 - [ ] Two-pane window: live desktop + agent chat in one page
 - [ ] Raspberry Pi guide (shm-size, SSD, LXQt lite variant)

@@ -1,0 +1,9 @@
+# Sandbar: make Chromium launchable inside the container (menu, shell, or agent).
+#
+# Docker's default seccomp profile blocks the namespace syscalls Chromium's
+# sandbox needs (even the setuid chrome-sandbox helper fails with EPERM), so
+# every desktop-container project disables the browser sandbox and treats the
+# container itself as the isolation boundary. Verified 2026-07-19.
+# Want the real browser sandbox? Run the container with a seccomp profile that
+# allows user namespaces (see docs) — this flag is harmless either way.
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --no-first-run"

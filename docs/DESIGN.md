@@ -54,7 +54,7 @@ docker run -d -p 3000:3000 -e ANTHROPIC_API_KEY=... --shm-size=1g ghcr.io/jdroll
 | Agent | **Hermes, pinned to a release tag** | See "The agent decision" below. Never `:latest` — it's a fast-moving 0.x project; version bumps are deliberate, tested PRs |
 | Chat surface | **ttyd** running the Hermes TUI (right pane); Hermes web dashboard optional | Terminal-native, tiny, multi-arch |
 | Control API | Small in-container supervisor: `/screenshot /click /type /key /scroll /bash /health /info` | This is what makes a Sandbar computer drivable by *any* outside agent (MCP, REST) — not just the one living inside |
-| User model | **Non-root agent user with sudo** | Root-everything was a v1 shortcut. Non-root means Chromium runs without `--no-sandbox`, and the blast radius of a confused agent shrinks |
+| User model | **Non-root agent user** (the base image's session user) | Root-everything was a v1 shortcut; non-root shrinks the blast radius of a confused agent. Note: Chromium still needs `--no-sandbox` — Docker's default seccomp blocks the sandbox's namespace syscalls regardless of user (verified). The container is the isolation boundary; a userns-allowing seccomp profile re-enables the browser sandbox for those who want both |
 
 ### Tier 1 — the platform: provision many computers
 

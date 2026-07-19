@@ -34,7 +34,8 @@ have_compose() {
 if ! have_compose; then
   if [[ "$OS" == "Linux" ]] && ! command -v docker >/dev/null 2>&1; then
     printf 'Docker is not installed. Install Docker Engine using get.docker.com? [y/N] '
-    read -r answer
+    # Read from the terminal, not stdin — under `curl | bash` stdin is the script itself.
+    read -r answer < /dev/tty
     if [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]; then
       # This is intentionally opt-in: it executes Docker's upstream installer as root.
       curl -fsSL https://get.docker.com | sh
@@ -96,7 +97,7 @@ docker compose -f "$SOURCE_DIR/compose.yml" up -d --build
 say "Waiting for platform health check…"
 ready=false
 for _ in $(seq 1 60); do
-  if curl -fsS "http://localhost:9000/api/health" | grep -q '"status":"ok"'; then
+  if curl -fs --max-time 3 "http://localhost:9000/api/health" 2>/dev/null | grep -q '"status":"ok"'; then
     ready=true
     break
   fi
@@ -109,7 +110,9 @@ docker pull ghcr.io/jdrolls/sandbar-desktop:latest
 
 # /data/token is created with mode 0600 by the platform. Logs are only a fallback
 # for older platform images that printed the first-run token but did not persist it.
-TOKEN="$(docker compose -f "$SOURCE_DIR/compose.yml" exec -T platform cat /data/token 2>/dev/null || true)"
+# </dev/null is load-bearing: under `curl | bash`, exec -T would otherwise consume
+# the remainder of this script as the container's stdin and silently end the install.
+TOKEN="$(docker compose -f "$SOURCE_DIR/compose.yml" exec -T platform cat /data/token </dev/null 2>/dev/null || true)"
 TOKEN="${TOKEN//$'\n'/}"
 if [[ ! "$TOKEN" =~ ^[a-f0-9]{32}$ ]]; then
   TOKEN="$(docker compose -f "$SOURCE_DIR/compose.yml" logs platform 2>/dev/null | grep -Eo '[a-f0-9]{32}' | tail -n 1 || true)"
@@ -136,7 +139,8 @@ HOST_IP="$(first_non_loopback_ip)"
 
 cat <<EOF
 
-╔════════════════════════════════════════════════════════════════╗n║ Sandbar is ready                                                ║
+╔════════════════════════════════════════════════════════════════╗
+║ Sandbar is ready                                                ║
 ╠════════════════════════════════════════════════════════════════╣
 ║ Dashboard: http://${HOST_IP}:9000
 ║ Token:     ${TOKEN}

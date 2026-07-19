@@ -30,7 +30,7 @@ The one-command agent computer.
 - [x] `sandbar-desktop` skill seeded (GUI control via shell + xdotool)
 - [ ] Agent adapter contract: `hermes` and `none` adapters formalized
 - [x] Non-root agent user (desktop session user, not root)
-- [ ] Control API (screenshot / click / type / key / scroll / bash / health / info)
+- [x] Control API (screenshot / click / type / key / scroll / bash / health / info) — token-gated, off by default; basic auth (`CUSTOM_USER`/`PASSWORD`) covers desktop + chat
 - [ ] Two-pane window: live desktop + agent chat in one page
 - [ ] Raspberry Pi guide (shm-size, SSD, LXQt lite variant)
 - [ ] Exec-approval model reviewed and documented for isolated containers

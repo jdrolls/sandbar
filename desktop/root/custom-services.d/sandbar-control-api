@@ -1,0 +1,13 @@
+#!/usr/bin/with-contenv bash
+# Wait for Webtop's X server and XFCE session before accepting GUI-control requests.
+set -e
+
+until DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 \
+  && pgrep -u abc xfce4-session >/dev/null 2>&1; do
+  sleep 1
+done
+
+# The API process is intentionally the desktop user, never root.
+export HOME=/config
+export DISPLAY=:1
+exec s6-setuidgid abc python3 /usr/local/bin/sandbar-control-api.py

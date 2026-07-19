@@ -8,5 +8,11 @@ until DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 \
   sleep 1
 done
 
+# Reuse Webtop's optional HTTP basic-auth credentials for chat when both exist.
+ttyd_auth=()
+if [[ -n "${CUSTOM_USER:-}" && -n "${PASSWORD:-}" ]]; then
+  ttyd_auth=(-c "$CUSTOM_USER:$PASSWORD")
+fi
+
 # ttyd stays root-owned; each connected terminal is explicitly dropped to abc.
-exec ttyd -p 7681 -W s6-setuidgid abc /usr/local/bin/sandbar-session.sh
+exec ttyd -p 7681 "${ttyd_auth[@]}" -W s6-setuidgid abc /usr/local/bin/sandbar-session.sh

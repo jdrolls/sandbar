@@ -40,7 +40,7 @@ RUN mkdir -p /etc/sandbar \
     && hermes --version | head -1 > /etc/sandbar/hermes-version \
     && chown -R abc:abc /config
 
-EXPOSE 7681
+EXPOSE 7681 8080
 
 # lsio convention: overlay custom services, init scripts, and Sandbar's agent skill.
 COPY --chmod=755 root/ /

@@ -16,6 +16,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl git python3 python3-venv tmux jq xz-utils \
         at-spi2-core dbus-x11 xdotool wmctrl scrot \
+        ripgrep ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Spike finding 2: ttyd is absent from trixie, so use its static arch-aware release.
@@ -26,8 +27,10 @@ RUN TTYD_ARCH="$( [ "$TARGETARCH" = "arm64" ] && echo aarch64 || echo x86_64 )" 
     && ttyd --version
 
 # Spike finding 3: install Hermes into the persistent /config home as root.
-# TODO: pin Hermes to a release ref once the installer supports it.
-RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh | HOME=/config bash
+# Pinned to the v0.18.2 release commit via the installer's --commit flag —
+# no `:latest` surprises. Bumps are deliberate: update the ARG, rebuild, retest.
+ARG HERMES_COMMIT=36f2a966c7f9f69987494b867c3dcf96b69a5766
+RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh | HOME=/config bash -s -- --commit "${HERMES_COMMIT}"
 
 # Spike finding 5: cua-driver currently injects input only in the background on Linux.
 # Sandbar therefore documents xdotool/XTest as the reliable GUI-control path.

@@ -7,6 +7,14 @@ export USER=abc
 export DISPLAY=:1
 export PATH=/config/.local/bin:$PATH
 
+# A bring-your-own-agent session must not touch Hermes or its session setup.
+if [ "${SANDBAR_AGENT:-hermes}" = "none" ]; then
+  cat <<'EOF'
+Sandbar (no built-in agent). Drive this computer via the control API on :8080 or install your own agent. The desktop is next door.
+EOF
+  exec bash
+fi
+
 # Hermes must share XFCE's session D-Bus, not a root or newly-created bus.
 xfce_pid="$(pgrep -u abc -o xfce4-session || true)"
 if [ -z "$xfce_pid" ] || [ ! -r "/proc/$xfce_pid/environ" ]; then

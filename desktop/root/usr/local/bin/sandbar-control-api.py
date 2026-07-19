@@ -23,6 +23,7 @@ KEY_RE = re.compile(r"^[A-Za-z0-9_+]+$")
 SCREENSHOT_PATH = "/tmp/.sandbar-shot.png"
 SCREENSHOT_LOCK = threading.Lock()
 CAPABILITIES = ["screenshot", "click", "type", "key", "scroll", "bash"]
+UI_PATH = "/usr/local/share/sandbar-ui/index.html"
 
 
 class APIError(Exception):
@@ -93,7 +94,7 @@ def require_int(body, name, minimum=None, maximum=None):
 
 
 class SandbarControlHandler(BaseHTTPRequestHandler):
-    """Routes authenticated requests while keeping the health probe public."""
+    """Routes public status/UI requests and authenticated control requests."""
 
     server_version = "SandbarControl/1.0"
 
@@ -105,6 +106,14 @@ class SandbarControlHandler(BaseHTTPRequestHandler):
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_html(self, status, data):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -168,6 +177,9 @@ class SandbarControlHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json(200, {"status": "ok"})
             return
+        if path in ("/", "/ui"):
+            self.handle_ui()
+            return
         if not self.authorized():
             return
 
@@ -201,6 +213,19 @@ class SandbarControlHandler(BaseHTTPRequestHandler):
                 raise APIError(404, "Not found.")
         except APIError as error:
             self.send_error_json(error.status, error.message)
+
+    def handle_ui(self):
+        """Serve the editable container-side UI without exposing control endpoints."""
+        try:
+            with open(UI_PATH, "rb") as ui_file:
+                data = ui_file.read()
+        except FileNotFoundError:
+            self.send_error_json(404, "Sandbar UI is not installed.")
+            return
+        except OSError as error:
+            self.send_error_json(500, "Sandbar UI could not be read: %s" % error)
+            return
+        self.send_html(200, data)
 
     def handle_info(self):
         geometry = run_gui_command(["xdotool", "getdisplaygeometry"]).stdout.strip().split()

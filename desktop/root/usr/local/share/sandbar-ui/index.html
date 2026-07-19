@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sandbar</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #111315;
+      --surface: #181b1e;
+      --border: #2b3035;
+      --text: #edf0f2;
+      --muted: #a4abb1;
+      --accent: #e2b260;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      height: 100vh;
+      overflow: hidden;
+      background: var(--background);
+      color: var(--text);
+      font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .app { display: flex; flex-direction: column; height: 100%; }
+
+    .topbar {
+      display: flex;
+      flex: 0 0 40px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+
+    .wordmark { font-weight: 650; letter-spacing: .01em; }
+
+    .links { display: flex; gap: 6px; }
+
+    .links a, .hint button {
+      color: var(--muted);
+      text-decoration: none;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      background: transparent;
+      padding: 3px 7px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .links a:hover, .hint button:hover { color: var(--text); border-color: #4a5259; }
+
+    .hint {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex: 0 0 auto;
+      padding: 7px 14px;
+      color: #f1d39e;
+      background: #2b2419;
+      border-bottom: 1px solid #4d3e26;
+    }
+
+    .workspace {
+      display: flex;
+      flex: 1 1 auto;
+      min-height: 0;
+      --desktop-width: 72%;
+    }
+
+    .pane { min-width: 0; min-height: 0; }
+    .desktop-pane { flex: 0 0 var(--desktop-width); }
+    .chat-pane { flex: 1 1 0; }
+
+    iframe {
+      display: block;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #0c0e10;
+    }
+
+    .divider {
+      flex: 0 0 8px;
+      position: relative;
+      cursor: col-resize;
+      touch-action: none;
+      background: var(--background);
+    }
+
+    .divider::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 3px;
+      width: 2px;
+      background: var(--border);
+    }
+
+    .divider:hover::after, .divider.dragging::after { background: var(--accent); }
+    body.dragging { user-select: none; cursor: col-resize; }
+
+    @media (max-width: 640px) {
+      .topbar { padding: 0 9px; }
+      .links a { padding: 3px 5px; }
+      .hint { padding: 7px 9px; }
+      .workspace { --desktop-width: 60%; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="wordmark">⛱ Sandbar</div>
+      <nav class="links" aria-label="Open surfaces separately">
+        <a id="desktop-link" target="_blank" rel="noopener noreferrer">Desktop ⧉</a>
+        <a id="chat-link" target="_blank" rel="noopener noreferrer">Chat ⧉</a>
+      </nav>
+    </header>
+    <div id="http-hint" class="hint" hidden>
+      <span>Remote over plain HTTP? The desktop stream needs HTTPS — see README.</span>
+      <button id="dismiss-hint" type="button" aria-label="Dismiss HTTPS hint">Dismiss</button>
+    </div>
+    <section id="workspace" class="workspace" aria-label="Sandbar desktop and chat">
+      <div class="pane desktop-pane"><iframe id="desktop" title="Sandbar desktop" allow="clipboard-read; clipboard-write"></iframe></div>
+      <div id="divider" class="divider" role="separator" aria-orientation="vertical" aria-label="Resize desktop and chat panes"></div>
+      <div class="pane chat-pane"><iframe id="chat" title="Sandbar chat"></iframe></div>
+    </section>
+  </main>
+
+  <script>
+    // This page deliberately has no dependencies: it only composes existing Sandbar surfaces.
+    (() => {
+      const workspace = document.getElementById("workspace");
+      const divider = document.getElementById("divider");
+      const desktop = document.getElementById("desktop");
+      const chat = document.getElementById("chat");
+      const splitKey = "sandbar.desktopSplit";
+      const params = new URLSearchParams(window.location.search);
+      const hostname = window.location.hostname.includes(":")
+        ? `[${window.location.hostname}]`
+        : window.location.hostname;
+      const defaultDesktop = `${window.location.protocol}//${hostname}:3000`;
+      const defaultChat = `${window.location.protocol}//${hostname}:7681`;
+
+      // Query values can target a reverse proxy; only web URLs are safe iframe destinations.
+      function surfaceUrl(value, fallback) {
+        if (!value) return fallback;
+        try {
+          const url = new URL(value, window.location.href);
+          return url.protocol === "http:" || url.protocol === "https:" ? url.href : fallback;
+        } catch (_) {
+          return fallback;
+        }
+      }
+
+      const desktopUrl = surfaceUrl(params.get("desktop"), defaultDesktop);
+      const chatUrl = surfaceUrl(params.get("chat"), defaultChat);
+      desktop.src = desktopUrl;
+      chat.src = chatUrl;
+      document.getElementById("desktop-link").href = desktopUrl;
+      document.getElementById("chat-link").href = chatUrl;
+
+      function setSplit(value, save) {
+        const split = Math.max(20, Math.min(85, value));
+        workspace.style.setProperty("--desktop-width", `${split}%`);
+        if (save) {
+          try { window.localStorage.setItem(splitKey, String(split)); } catch (_) { /* Storage may be unavailable. */ }
+        }
+      }
+
+      try {
+        const savedSplit = Number(window.localStorage.getItem(splitKey));
+        if (Number.isFinite(savedSplit)) setSplit(savedSplit, false);
+      } catch (_) { /* The default split remains in use. */ }
+
+      divider.addEventListener("pointerdown", (event) => {
+        divider.setPointerCapture(event.pointerId);
+        divider.classList.add("dragging");
+        document.body.classList.add("dragging");
+      });
+
+      divider.addEventListener("pointermove", (event) => {
+        if (!divider.hasPointerCapture(event.pointerId)) return;
+        const bounds = workspace.getBoundingClientRect();
+        if (bounds.width > 0) setSplit(((event.clientX - bounds.left) / bounds.width) * 100, true);
+      });
+
+      function stopDragging(event) {
+        if (divider.hasPointerCapture(event.pointerId)) divider.releasePointerCapture(event.pointerId);
+        divider.classList.remove("dragging");
+        document.body.classList.remove("dragging");
+      }
+
+      divider.addEventListener("pointerup", stopDragging);
+      divider.addEventListener("pointercancel", stopDragging);
+
+      const remoteHttp = window.location.protocol === "http:" &&
+        window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1";
+      const hint = document.getElementById("http-hint");
+      if (remoteHttp) hint.hidden = false;
+      document.getElementById("dismiss-hint").addEventListener("click", () => { hint.hidden = true; });
+    })();
+  </script>
+</body>
+</html>

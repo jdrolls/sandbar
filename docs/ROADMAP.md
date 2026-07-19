@@ -28,12 +28,12 @@ The one-command agent computer.
 - [x] First-run onboarding: no baked keys — native Hermes wizard in the chat pane; env keys skip it
 - [x] Agent runs inside the desktop session (session user + session D-Bus), verified end-to-end: agent opened a terminal and typed into it
 - [x] `sandbar-desktop` skill seeded (GUI control via shell + xdotool)
-- [ ] Agent adapter contract: `hermes` and `none` adapters formalized
+- [x] Agent adapter contract: `hermes` (default) and `none` (BYO agent via control API/MCP) via `SANDBAR_AGENT`
 - [x] Non-root agent user (desktop session user, not root)
 - [x] Control API (screenshot / click / type / key / scroll / bash / health / info) — token-gated, off by default; basic auth (`CUSTOM_USER`/`PASSWORD`) covers desktop + chat
-- [ ] Two-pane window: live desktop + agent chat in one page
-- [ ] Raspberry Pi guide (shm-size, SSD, LXQt lite variant)
-- [ ] Exec-approval model reviewed and documented for isolated containers
+- [x] The Window: desktop + chat in one page at `:8080/` (draggable split, per-surface links, secure-context hint)
+- [x] Raspberry Pi guide ([docs/raspberry-pi.md](raspberry-pi.md))
+- [x] Exec-approval model reviewed and documented (Hermes defaults kept: interactive classifier gates dangerous commands in the chat pane; hardening knobs documented)
 
 ## Phase 2 — Platform (Tier 1)
 

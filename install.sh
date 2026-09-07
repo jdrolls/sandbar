@@ -11,6 +11,22 @@ SOURCE_DIR="${INSTALL_ROOT}/src"
 say() { printf '\n%s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# Keep installer detection aligned with Platform's startup parser. Do not accept
+# wildcard, LAN, public, ambiguous, or CIDR-edge addresses as Docker bind IPs.
+is_allowed_bind_ip() {
+  local ip="$1" octet
+  local -a octets
+  IFS='.' read -r -a octets <<< "$ip"
+  [[ "${#octets[@]}" -eq 4 ]] || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    (( 10#$octet <= 255 )) || return 1
+  done
+  [[ "$ip" == "127.0.0.1" ]] && return 0
+  (( 10#${octets[0]} == 100 && 10#${octets[1]} >= 64 && 10#${octets[1]} <= 127 )) || return 1
+  [[ "$ip" != "100.64.0.0" && "$ip" != "100.127.255.255" ]]
+}
+
 # Sandbar publishes desktop images for these two Docker architectures only.
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -47,6 +63,13 @@ if ! have_compose; then
   fi
 fi
 have_compose || die "Docker Compose is unavailable after Docker installation."
+
+# Only show the bootstrap token when this invocation creates the local source.
+# Refreshes retain the platform token and must not expose it again.
+INITIAL_INSTALL=false
+if [[ ! -e "$SOURCE_DIR" ]]; then
+  INITIAL_INSTALL=true
+fi
 
 mkdir -p "$INSTALL_ROOT"
 
@@ -90,6 +113,25 @@ fi
 
 [[ -f "$SOURCE_DIR/compose.yml" ]] || die "compose.yml was not downloaded."
 
+# An operator's explicit safe bind wins. Otherwise, use a currently assigned
+# Tailscale IPv4 address for this run only; do not save a potentially stale IP.
+if [[ -n "${SANDBAR_BIND_IP:-}" ]]; then
+  is_allowed_bind_ip "$SANDBAR_BIND_IP" || die "SANDBAR_BIND_IP must be 127.0.0.1 or a usable Tailscale CGNAT IPv4 address."
+  BIND_IP="$SANDBAR_BIND_IP"
+  BIND_SOURCE="explicit"
+else
+  BIND_IP="127.0.0.1"
+  BIND_SOURCE="default"
+  if command -v tailscale >/dev/null 2>&1; then
+    detected_tailscale_ip="$(tailscale ip -4 2>/dev/null || true)"
+    if is_allowed_bind_ip "$detected_tailscale_ip" && [[ "$detected_tailscale_ip" != "127.0.0.1" ]]; then
+      BIND_IP="$detected_tailscale_ip"
+      BIND_SOURCE="auto-detected"
+    fi
+  fi
+fi
+export SANDBAR_BIND_IP="$BIND_IP"
+
 say "Starting Sandbar platform for ${ARCH}…"
 docker compose -f "$SOURCE_DIR/compose.yml" up -d --build
 
@@ -97,7 +139,7 @@ docker compose -f "$SOURCE_DIR/compose.yml" up -d --build
 say "Waiting for platform health check…"
 ready=false
 for _ in $(seq 1 60); do
-  if curl -fs --max-time 3 "http://localhost:9000/api/health" 2>/dev/null | grep -q '"status":"ok"'; then
+  if curl -fs --max-time 3 "http://${BIND_IP}:9000/api/health" 2>/dev/null | grep -q '"status":"ok"'; then
     ready=true
     break
   fi
@@ -108,44 +150,47 @@ done
 say "Pre-pulling ghcr.io/jdrolls/sandbar-desktop:latest (~7GB one-time download)…"
 docker pull ghcr.io/jdrolls/sandbar-desktop:latest
 
-# /data/token is created with mode 0600 by the platform. Logs are only a fallback
-# for older platform images that printed the first-run token but did not persist it.
-# </dev/null is load-bearing: under `curl | bash`, exec -T would otherwise consume
-# the remainder of this script as the container's stdin and silently end the install.
-TOKEN="$(docker compose -f "$SOURCE_DIR/compose.yml" exec -T platform cat /data/token </dev/null 2>/dev/null || true)"
-TOKEN="${TOKEN//$'\n'/}"
-if [[ ! "$TOKEN" =~ ^[a-f0-9]{32}$ ]]; then
-  TOKEN="$(docker compose -f "$SOURCE_DIR/compose.yml" logs platform 2>/dev/null | grep -Eo '[a-f0-9]{32}' | tail -n 1 || true)"
+if [[ "$INITIAL_INSTALL" == "true" ]]; then
+  # /data/token is created with mode 0600 by the platform. Logs are only a fallback
+  # for older platform images that printed the first-run token but did not persist it.
+  # </dev/null is load-bearing: under `curl | bash`, exec -T would otherwise consume
+  # the remainder of this script as the container's stdin and silently end the install.
+  TOKEN="$(docker compose -f "$SOURCE_DIR/compose.yml" exec -T platform cat /data/token </dev/null 2>/dev/null || true)"
+  TOKEN="${TOKEN//$'\n'/}"
+  if [[ ! "$TOKEN" =~ ^[a-f0-9]{32}$ ]]; then
+    TOKEN="$(docker compose -f "$SOURCE_DIR/compose.yml" logs platform 2>/dev/null | grep -Eo '[a-f0-9]{32}' | tail -n 1 || true)"
+  fi
+  [[ "$TOKEN" =~ ^[a-f0-9]{32}$ ]] || die "Could not read the platform token. Run: docker compose -f $SOURCE_DIR/compose.yml logs platform"
 fi
-[[ "$TOKEN" =~ ^[a-f0-9]{32}$ ]] || die "Could not read the platform token. Run: docker compose -f $SOURCE_DIR/compose.yml logs platform"
 
-first_non_loopback_ip() {
-  local candidate
-  if hostname -I >/dev/null 2>&1; then
-    candidate="$(hostname -I | awk '{print $1}')"
-    [[ -n "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
-  fi
-  if command -v ip >/dev/null 2>&1; then
-    candidate="$(ip -4 -o addr show scope global | awk 'NR==1 {split($4, a, "/"); print a[1]}')"
-    [[ -n "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
-  fi
-  if command -v ifconfig >/dev/null 2>&1; then
-    candidate="$(ifconfig | awk '$1 == "inet" && $2 != "127.0.0.1" {print $2; exit}')"
-    [[ -n "$candidate" ]] && { printf '%s\n' "$candidate"; return; }
-  fi
-  printf 'localhost\n'
-}
-HOST_IP="$(first_non_loopback_ip)"
-
-cat <<EOF
+cat <<'EOF'
 
 ╔════════════════════════════════════════════════════════════════╗
 ║ Sandbar is ready                                                ║
 ╠════════════════════════════════════════════════════════════════╣
-║ Dashboard: http://${HOST_IP}:9000
-║ Token:     ${TOKEN}
-╠════════════════════════════════════════════════════════════════╣
-║ For private remote access, install Tailscale on this host.      ║
+EOF
+
+if [[ "$BIND_IP" == "127.0.0.1" ]]; then
+  printf '║ Local-only dashboard: http://localhost:9000                    ║\n'
+else
+  printf '║ %-62s ║\n' "Direct tailnet dashboard: http://${BIND_IP}:9000"
+  printf '║ Dashboard links use direct per-seat tailnet ports.              ║\n'
+fi
+
+if [[ "$INITIAL_INSTALL" == "true" ]]; then
+  printf '║ %-62s ║\n' "Token:     ${TOKEN}"
+fi
+
+if [[ "$BIND_IP" == "127.0.0.1" ]]; then
+  cat <<'EOF'
+║ Tailscale Serve is optional for this dashboard only; it does    ║
+║ not route the dynamic per-seat port pool.                        ║
+EOF
+else
+  printf '║ Bind source: %s SANDBAR_BIND_IP.                              ║\n' "$BIND_SOURCE"
+fi
+
+cat <<'EOF'
 ║ Create your first computer from the dashboard.                  ║
 ╚════════════════════════════════════════════════════════════════╝
 EOF

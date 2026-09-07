@@ -58,7 +58,7 @@ Add `-p 8080:8080` and open **`http://localhost:8080`** — the Sandbar Window: 
 curl -fsSL https://raw.githubusercontent.com/jdrolls/sandbar/main/install.sh | bash
 ```
 
-The installer checks Docker, brings up the control plane, and prints your dashboard URL + access token. Create and destroy computers from the dashboard or the API; plug the [MCP server](platform/mcp/) into Claude Code (or any MCP client) to use your computers as native tools. Private-by-default: the recommended remote-access path is [Tailscale](https://tailscale.com) (zero open ports).
+The installer checks Docker, brings up the control plane, and prints your dashboard URL + access token. Create and destroy computers from the dashboard or the API; plug the [MCP server](platform/mcp/) into Claude Code (or any MCP client) to use your computers as native tools. Private-by-default: Platform and every seat bind to loopback. For verified remote use on a [Tailscale](https://tailscale.com) tailnet, set `SANDBAR_BIND_IP` to the host's Tailscale IPv4 address (or let the installer detect one for that run); the dashboard's direct per-seat links then work on their dynamic ports. Tailscale Serve is optional for a single dashboard only, not the dynamic seat pool.
 
 ## How it works
 
@@ -106,7 +106,7 @@ Sandbar's agent layer is a thin adapter contract — the computer doesn't care w
 
 ## Security posture
 
-- Non-root agent user inside the container; hardened runtime (`no-new-privileges`, per-computer networks)
+- Non-root agent user inside the container; hardened runtime (`no-new-privileges`, resource caps, per-computer networks)
 - No Docker socket in anything internet-facing
 - Every surface authenticated — desktop, terminal, and API routes all require tokens
 - Private-by-default access (Tailscale first); public exposure is an explicit choice
@@ -119,6 +119,7 @@ See [SECURITY.md](SECURITY.md) for reporting.
 
 - 📐 [Design](docs/DESIGN.md) — the full architecture and every decision with its reasoning
 - 🗺️ [Roadmap](docs/ROADMAP.md) — what's built, what's next
+- 🖥️ [Jarvis agent fleet](docs/JARVIS_AGENT_FLEET.md) — staged private-pool operating reference
 - 🧪 [Spike](spike/) — the current proving ground (watch this space)
 
 ## License

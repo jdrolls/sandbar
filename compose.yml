@@ -2,13 +2,17 @@ services:
   platform:
     build: ./platform
     ports:
-      - "9000:9000"
+      - "${SANDBAR_BIND_IP:-127.0.0.1}:9000:9000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - sandbar-platform-data:/data
     restart: unless-stopped
     environment:
       SANDBAR_IMAGE: ghcr.io/jdrolls/sandbar-desktop:latest
+      SANDBAR_BIND_IP: ${SANDBAR_BIND_IP:-127.0.0.1}
+      SANDBAR_COMPUTER_CPU_LIMIT: ${SANDBAR_COMPUTER_CPU_LIMIT:-1}
+      SANDBAR_COMPUTER_MEMORY_LIMIT: ${SANDBAR_COMPUTER_MEMORY_LIMIT:-2147483648}
+      SANDBAR_COMPUTER_PIDS_LIMIT: ${SANDBAR_COMPUTER_PIDS_LIMIT:-512}
 
 volumes:
   sandbar-platform-data:

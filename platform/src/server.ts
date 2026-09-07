@@ -3,6 +3,7 @@ import { SandbarDatabase, type Computer } from "./db";
 import { DockerDesktop, DockerError, type DockerState } from "./docker";
 import { dashboardPage, loginPage, type ComputerView } from "./html";
 import { allocatePortBlock, computerPort } from "./ports";
+import { sandbarNetworkConfiguration } from "./resources";
 
 const DATA_DIRECTORY = process.env.SANDBAR_DATA_DIR ?? "/data";
 const MAX_JSON_BYTES = 1_024 * 1_024;
@@ -127,8 +128,24 @@ async function withCreationLock<T>(operation: () => Promise<T>): Promise<T> {
   }
 }
 
-async function views(): Promise<ComputerView[]> {
+interface ComputerState {
+  computer: Computer;
+  state: DockerState;
+}
+
+async function computerStates(): Promise<ComputerState[]> {
   return Promise.all(database.listComputers().map(async (computer) => ({ computer, state: await docker.inspect(computer) })));
+}
+
+async function views(): Promise<ComputerView[]> {
+  const states = await computerStates();
+  return states.map(({ computer, state }) => ({
+    id: computer.id,
+    name: computer.name,
+    agent: computer.agent,
+    basePort: computer.basePort,
+    state,
+  }));
 }
 
 async function requireComputer(id: string): Promise<Computer> {
@@ -144,7 +161,7 @@ async function handleApi(request: Request, url: URL): Promise<Response> {
 
   const segments = url.pathname.split("/").filter(Boolean);
   if (request.method === "GET" && url.pathname === "/api/computers") {
-    const listed = await views();
+    const listed = await computerStates();
     return json({ computers: listed.map(({ computer, state }) => computerResponse(computer, state)) });
   }
 
@@ -182,6 +199,7 @@ async function handleApi(request: Request, url: URL): Promise<Response> {
     const computer = await requireComputer(segments[2]);
     const purge = url.searchParams.get("purge") === "true";
     await docker.removeContainer(computer.id, true);
+    await docker.removeNetwork(computer.id);
     if (purge) await docker.removeVolume(computer.id);
     database.deleteComputer(computer.id);
     return json({ status: "ok" });
@@ -226,7 +244,7 @@ const server = Bun.serve({
 });
 
 if (platformToken.created) {
-  console.log(`\n╔══════════════════════════════════════════════════════════╗\n║ Sandbar platform is ready                                ║\n║ Dashboard: http://localhost:${server.port}                         ║\n║ Platform token: ${platformToken.token}                  ║\n║ Save this token; it is required to access Sandbar.       ║\n╚══════════════════════════════════════════════════════════╝\n`);
+  console.log(`\n╔══════════════════════════════════════════════════════════╗\n║ Sandbar platform is ready                                ║\n║ Dashboard: http://${sandbarNetworkConfiguration.bindIp}:${server.port}                         ║\n║ Platform token: ${platformToken.token}                  ║\n║ Save this token; it is required to access Sandbar.       ║\n╚══════════════════════════════════════════════════════════╝\n`);
 } else {
-  console.log(`Sandbar platform listening at http://0.0.0.0:${server.port}`);
+  console.log(`Sandbar platform listening at http://${sandbarNetworkConfiguration.bindIp}:${server.port}`);
 }

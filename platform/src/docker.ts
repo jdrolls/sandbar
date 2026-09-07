@@ -1,4 +1,5 @@
 import { computerPort } from "./ports";
+import { computerResourceLimits, sandbarNetworkConfiguration } from "./resources";
 import type { Computer } from "./db";
 
 const DOCKER_API = "http://localhost/v1.44";
@@ -54,6 +55,10 @@ function volumeName(id: string): string {
   return `sandbar-${id}-config`;
 }
 
+function networkName(id: string): string {
+  return `sandbar-${id}-network`;
+}
+
 function jsonRequest(method: string, body?: unknown): RequestInit {
   return {
     method,
@@ -67,17 +72,29 @@ export type DockerState = "running" | "created" | "exited" | "paused" | "restart
 export class DockerDesktop {
   async createAndStart(computer: Computer, createEnv: Readonly<Record<string, string>>): Promise<void> {
     const volume = volumeName(computer.id);
+    const network = networkName(computer.id);
+    let networkCreated = false;
     let volumeCreated = false;
     let containerCreated = false;
     try {
+      // A user-defined bridge gives this computer NATed internet access without
+      // placing it on the default bridge or another computer's network.
+      await dockerRequest("/networks/create", jsonRequest("POST", {
+        Name: network,
+        Driver: "bridge",
+        Internal: false,
+        CheckDuplicate: true,
+      }));
+      networkCreated = true;
+
       await dockerRequest("/volumes/create", jsonRequest("POST", { Name: volume }));
       volumeCreated = true;
 
-      const bindings: Record<string, Array<{ HostPort: string }>> = {
-        "3000/tcp": [{ HostPort: String(computerPort.desktopHttp(computer.basePort)) }],
-        "3001/tcp": [{ HostPort: String(computerPort.desktopHttps(computer.basePort)) }],
-        "7681/tcp": [{ HostPort: String(computerPort.chat(computer.basePort)) }],
-        "8080/tcp": [{ HostPort: String(computerPort.control(computer.basePort)) }],
+      const bindings: Record<string, Array<{ HostIp: string; HostPort: string }>> = {
+        "3000/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.desktopHttp(computer.basePort)) }],
+        "3001/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.desktopHttps(computer.basePort)) }],
+        "7681/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.chat(computer.basePort)) }],
+        "8080/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.control(computer.basePort)) }],
       };
       const exposedPorts: Record<string, Record<string, never>> = Object.fromEntries(
         DESKTOP_PORTS.map((port) => [port, {}]),
@@ -93,19 +110,29 @@ export class DockerDesktop {
           Env: Array.from(environment, ([key, value]) => `${key}=${value}`),
           ExposedPorts: exposedPorts,
           HostConfig: {
+            NetworkMode: network,
             PortBindings: bindings,
             ShmSize: 1_073_741_824,
+            NanoCpus: computerResourceLimits.nanoCpus,
+            Memory: computerResourceLimits.memoryBytes,
+            PidsLimit: computerResourceLimits.pidsLimit,
+            SecurityOpt: ["no-new-privileges:true"],
             RestartPolicy: { Name: "unless-stopped" },
             Mounts: [{ Type: "volume", Source: volume, Target: "/config" }],
+          },
+          NetworkingConfig: {
+            EndpointsConfig: { [network]: {} },
           },
         }),
       );
       containerCreated = true;
       await dockerRequest(`/containers/${encodeURIComponent(containerName(computer.id))}/start`, jsonRequest("POST"));
     } catch (error) {
-      // Best-effort rollback ensures failed creations do not leave secret-bearing containers behind.
+      // Docker has no multi-resource transaction, so unwind in dependency order.
+      // This keeps failed create attempts from leaving a desktop or private network behind.
       if (containerCreated) await this.ignoreMissing(() => this.removeContainer(computer.id, true));
       if (volumeCreated) await this.ignoreMissing(() => this.removeVolume(computer.id));
+      if (networkCreated) await this.ignoreMissing(() => this.removeNetwork(computer.id));
       throw error;
     }
   }
@@ -144,6 +171,14 @@ export class DockerDesktop {
   async removeContainer(id: string, force = false): Promise<void> {
     try {
       await dockerRequest(`/containers/${encodeURIComponent(containerName(id))}?force=${force ? "true" : "false"}`, { method: "DELETE" });
+    } catch (error) {
+      if (!(error instanceof DockerError && error.status === 404)) throw error;
+    }
+  }
+
+  async removeNetwork(id: string): Promise<void> {
+    try {
+      await dockerRequest(`/networks/${encodeURIComponent(networkName(id))}`, { method: "DELETE" });
     } catch (error) {
       if (!(error instanceof DockerError && error.status === 404)) throw error;
     }

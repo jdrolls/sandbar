@@ -1,9 +1,12 @@
 import { computerPort } from "./ports";
-import type { Computer } from "./db";
 import type { DockerState } from "./docker";
 
+/** The dashboard boundary deliberately excludes per-computer control credentials. */
 export interface ComputerView {
-  computer: Computer;
+  id: string;
+  name: string;
+  agent: "hermes" | "none";
+  basePort: number;
   state: DockerState;
 }
 
@@ -25,8 +28,8 @@ function computerUrl(hostname: string, port: number, protocol = "http"): string 
   return `${protocol}://${formatHost(hostname)}:${port}/`;
 }
 
-function card(view: ComputerView, hostname: string): string {
-  const { computer, state } = view;
+function card(computer: ComputerView, hostname: string): string {
+  const { state } = computer;
   const running = state === "running";
   const desktopProtocol = "https";
   return `<article class="card">

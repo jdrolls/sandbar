@@ -37,13 +37,13 @@ The one-command agent computer.
 
 ## Phase 2 — Platform (Tier 1)
 
-Provision many computers; keep it optional.
+Provision many computers; keep it optional. The [Jarvis agent fleet reference](JARVIS_AGENT_FLEET.md) defines the staged private-pool rollout.
 
 - [x] Bun/TS control plane (`platform/`): provisioning CRUD + dashboard, zero runtime deps (Bun.serve + bun:sqlite + Docker Engine API over the socket). Design choice: **per-computer host-port blocks instead of path-rewriting proxies** — Selkies/ttyd under rewritten paths is the fragility v1 died of; direct ports compose cleanly with Tailscale/your own proxy
 - [x] Single-user token auth (generated at first run, printed once, stored in `/data/token`); per-computer control tokens minted at create time
 - [x] `install.sh` — arch detect, Docker check/bootstrap, compose up, health wait, token handoff
 - [x] MCP server (`platform/mcp/`) — list/create/delete computers + screenshot/bash/click/type/key as native tools; verified end-to-end from a real MCP handshake
-- [x] Private-by-default access documented throughout (Tailscale serve tips in every guide); Cloudflare Tunnel + Caddy/LE remain user's choice
+- [x] Private-by-default access documented throughout (default loopback; explicit or installer-detected Tailscale bind is the verified direct route for dynamic seat ports; Tailscale Serve is optional for one dashboard only); Cloudflare Tunnel + Caddy/LE remain user's choice
 - [ ] Multi-user opt-in mode (accounts, per-user keys, admin)
 - [ ] Publish `ghcr.io/jdrolls/sandbar-platform` image (today: `compose up --build` from the repo)
 

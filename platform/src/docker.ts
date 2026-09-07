@@ -1,5 +1,5 @@
 import { computerPort } from "./ports";
-import { computerResourceLimits, sandbarNetworkConfiguration } from "./resources";
+import { computerResourceLimits, desktopResolutionConfiguration, sandbarNetworkConfiguration } from "./resources";
 import type { Computer } from "./db";
 
 const DOCKER_API = "http://localhost/v1.44";
@@ -100,6 +100,11 @@ export class DockerDesktop {
         DESKTOP_PORTS.map((port) => [port, {}]),
       );
       const environment = new Map<string, string>(Object.entries(createEnv));
+      // Configure Selkies at container creation. MAX_RES blocks a connected
+      // viewer from expanding Xvfb beyond the operator-approved framebuffer.
+      environment.set("SELKIES_MANUAL_WIDTH", String(desktopResolutionConfiguration.width));
+      environment.set("SELKIES_MANUAL_HEIGHT", String(desktopResolutionConfiguration.height));
+      environment.set("MAX_RES", desktopResolutionConfiguration.maxResolution);
       environment.set("SANDBAR_TOKEN", computer.controlToken);
       environment.set("SANDBAR_AGENT", computer.agent);
 

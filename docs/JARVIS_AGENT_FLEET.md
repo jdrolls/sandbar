@@ -46,6 +46,11 @@ Platform startup reads these strict environment variables. Memory is bytes and C
 | `SANDBAR_COMPUTER_CPU_LIMIT` | `1` | Per-seat CPU cap |
 | `SANDBAR_COMPUTER_MEMORY_LIMIT` | `2147483648` | Per-seat memory cap (2 GiB) |
 | `SANDBAR_COMPUTER_PIDS_LIMIT` | `512` | Per-seat process cap |
+| `SANDBAR_COMPUTER_DESKTOP_WIDTH` | `1920` | Initial Selkies virtual desktop width in pixels |
+| `SANDBAR_COMPUTER_DESKTOP_HEIGHT` | `1080` | Initial Selkies virtual desktop height in pixels |
+| `SANDBAR_COMPUTER_DESKTOP_MAX_RES` | `1920x1080` | Largest allowed Webtop/Xvfb framebuffer, as `WIDTHxHEIGHT` |
+
+Platform passes the desktop values to Webtop at seat creation as `SELKIES_MANUAL_WIDTH`, `SELKIES_MANUAL_HEIGHT`, and `MAX_RES`; they are not an `xrandr` workaround applied after a viewer connects. The default maximum matches the initial 1920×1080 desktop, so a connected observer cannot resize a persistent seat into a larger Xvfb framebuffer and consume disproportionate CPU. Operators may change these values only as a deliberate fleet capacity decision: dimensions must be positive decimal integers, `MAX_RES` must use a bounded `WIDTHxHEIGHT` form, and its dimensions must be at least the initial desktop dimensions. Platform rejects invalid values during startup rather than creating a seat with an unexpected framebuffer. Existing containers retain their creation-time environment, so recreate a persistent seat to apply a changed resolution policy.
 
 ## Staged acceptance criteria
 
@@ -53,7 +58,7 @@ Before treating the initial pool as ready, verify on the intended Jarvis host th
 
 - with the default configuration, Platform and every seat publish only loopback listeners while host MCP control still works; with a Tailscale bind, the dashboard and its dynamically allocated per-seat ports work directly from another tailnet device without Tailscale Serve;
 - separate seats have distinct bridge networks, retain outbound connectivity, and cannot use a shared Sandbar network;
-- configured CPU, memory, PID, and `no-new-privileges` settings appear in container inspection;
+- configured CPU, memory, PID, `no-new-privileges`, `SELKIES_MANUAL_WIDTH=1920`, `SELKIES_MANUAL_HEIGHT=1080`, and `MAX_RES=1920x1080` settings appear in a newly created container inspection (unless an operator intentionally configured another validated desktop size);
 - failed creates and normal deletes remove the corresponding private network; ordinary delete retains the configuration volume and purge removes it;
 - two disposable seats plus one persistent seat pass the resource benchmark gate with acceptable host headroom;
 - Tailscale remote access works without adding public listeners; and

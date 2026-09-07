@@ -7,6 +7,16 @@ export interface ComputerResourceLimits {
   readonly pidsLimit: number;
 }
 
+/** Bounded virtual desktop dimensions passed to Webtop/Selkies. */
+export interface DesktopResolutionConfiguration {
+  /** Initial fixed virtual desktop width in pixels. */
+  readonly width: number;
+  /** Initial fixed virtual desktop height in pixels. */
+  readonly height: number;
+  /** Largest framebuffer Webtop will permit, formatted as WIDTHxHEIGHT. */
+  readonly maxResolution: string;
+}
+
 /** Host address used for every Docker-published Sandbar port. */
 export interface SandbarNetworkConfiguration {
   /** Either loopback or one usable address in Tailscale's IPv4 CGNAT range. */
@@ -17,6 +27,13 @@ const CPU_NANOSECONDS = 1_000_000_000;
 const DEFAULT_CPU_LIMIT = "1";
 const DEFAULT_MEMORY_LIMIT = "2147483648"; // 2 GiB
 const DEFAULT_PIDS_LIMIT = "512";
+const DEFAULT_DESKTOP_WIDTH = "1920";
+const DEFAULT_DESKTOP_HEIGHT = "1080";
+const DEFAULT_DESKTOP_MAX_RES = "1920x1080";
+// Webtop's own default maximum. Keeping this as a hard ceiling prevents an
+// accidental platform setting from creating an unbounded Xvfb framebuffer.
+const MAX_DESKTOP_WIDTH = 15_360;
+const MAX_DESKTOP_HEIGHT = 8_640;
 
 function invalidEnvironment(name: string, expectation: string): never {
   throw new Error(`${name} must be ${expectation}.`);
@@ -31,6 +48,25 @@ function parsePositiveInteger(name: string, value: string): number {
     return invalidEnvironment(name, "a positive safe integer");
   }
   return parsed;
+}
+
+function parseDesktopDimension(name: string, value: string, maximum: number): number {
+  const dimension = parsePositiveInteger(name, value);
+  if (dimension > maximum) {
+    return invalidEnvironment(name, `a positive integer no greater than ${maximum}`);
+  }
+  return dimension;
+}
+
+function parseDesktopMaxResolution(value: string): readonly [number, number] {
+  const match = /^([1-9]\d*)x([1-9]\d*)$/.exec(value);
+  if (match === null) {
+    return invalidEnvironment("SANDBAR_COMPUTER_DESKTOP_MAX_RES", "WIDTHxHEIGHT using positive decimal integers");
+  }
+  return [
+    parseDesktopDimension("SANDBAR_COMPUTER_DESKTOP_MAX_RES", match[1], MAX_DESKTOP_WIDTH),
+    parseDesktopDimension("SANDBAR_COMPUTER_DESKTOP_MAX_RES", match[2], MAX_DESKTOP_HEIGHT),
+  ];
 }
 
 function parseCpuLimit(value: string): number {
@@ -94,6 +130,36 @@ export function parseComputerResourceLimits(environment: Readonly<Record<string,
   };
 }
 
+/**
+ * Reads desktop dimensions once at startup. Values are intentionally bounded to
+ * Webtop's supported maximum so an accidental environment value cannot turn a
+ * seat into an oversized Xvfb workload.
+ */
+export function parseDesktopResolutionConfiguration(environment: Readonly<Record<string, string | undefined>>): DesktopResolutionConfiguration {
+  const width = parseDesktopDimension(
+    "SANDBAR_COMPUTER_DESKTOP_WIDTH",
+    environment.SANDBAR_COMPUTER_DESKTOP_WIDTH ?? DEFAULT_DESKTOP_WIDTH,
+    MAX_DESKTOP_WIDTH,
+  );
+  const height = parseDesktopDimension(
+    "SANDBAR_COMPUTER_DESKTOP_HEIGHT",
+    environment.SANDBAR_COMPUTER_DESKTOP_HEIGHT ?? DEFAULT_DESKTOP_HEIGHT,
+    MAX_DESKTOP_HEIGHT,
+  );
+  const [maxWidth, maxHeight] = parseDesktopMaxResolution(
+    environment.SANDBAR_COMPUTER_DESKTOP_MAX_RES ?? DEFAULT_DESKTOP_MAX_RES,
+  );
+  if (width > maxWidth || height > maxHeight) {
+    return invalidEnvironment(
+      "SANDBAR_COMPUTER_DESKTOP_MAX_RES",
+      "at least SANDBAR_COMPUTER_DESKTOP_WIDTH by SANDBAR_COMPUTER_DESKTOP_HEIGHT",
+    );
+  }
+  return { width, height, maxResolution: `${maxWidth}x${maxHeight}` };
+}
+
 export const computerResourceLimits = parseComputerResourceLimits(process.env);
+/** Parsed once before Docker requests so every generated desktop has the same bounded configuration. */
+export const desktopResolutionConfiguration = parseDesktopResolutionConfiguration(process.env);
 /** Parsed once before Docker requests so every generated desktop mapping shares one safe bind address. */
 export const sandbarNetworkConfiguration = parseSandbarNetworkConfiguration(process.env);

@@ -5,7 +5,8 @@ ARG TARGETARCH
 
 LABEL org.opencontainers.image.source="https://github.com/jdrolls/sandbar" \
       org.opencontainers.image.description="Sandbar AI-agent Linux desktop container" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.sandbar.chromium-sandbox="namespace-v1"
 
 # All build-time installers intentionally run as root; XFCE itself remains abc (spike finding 1).
 USER root

@@ -1,4 +1,5 @@
 import { isAuthorized, loginCookie, logoutCookie } from "./auth";
+import { HttpError, validateCreate } from "./create-input";
 import { SandbarDatabase, type Computer } from "./db";
 import { DockerDesktop, DockerError, type DockerState } from "./docker";
 import { dashboardPage, loginPage, type ComputerView } from "./html";
@@ -7,13 +8,6 @@ import { sandbarNetworkConfiguration } from "./resources";
 
 const DATA_DIRECTORY = process.env.SANDBAR_DATA_DIR ?? "/data";
 const MAX_JSON_BYTES = 1_024 * 1_024;
-const ENVIRONMENT_KEY = /^(?:[A-Z][A-Z0-9_]*_API_KEY|CUSTOM_USER|PASSWORD)$/;
-
-class HttpError extends Error {
-  constructor(readonly status: number, message: string) {
-    super(message);
-  }
-}
 
 function json(payload: unknown, status = 200, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(payload), {
@@ -72,26 +66,6 @@ function portsFor(basePort: number): Record<string, number> {
     chat: computerPort.chat(basePort),
     control: computerPort.control(basePort),
   };
-}
-
-function validateCreate(body: Record<string, unknown>): { name: string; agent: "hermes" | "none"; env: Record<string, string> } {
-  const rawName = body.name;
-  if (rawName !== undefined && typeof rawName !== "string") throw new HttpError(400, '"name" must be a string.');
-  const name = (rawName ?? "Sandbar computer").trim();
-  if (!name || name.length > 80) throw new HttpError(400, '"name" must be 1 to 80 characters.');
-
-  const agent = body.agent ?? "hermes";
-  if (agent !== "hermes" && agent !== "none") throw new HttpError(400, '"agent" must be "hermes" or "none".');
-
-  if (body.env !== undefined && !isRecord(body.env)) throw new HttpError(400, '"env" must be an object.');
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(body.env ?? {})) {
-    if (!ENVIRONMENT_KEY.test(key) || typeof value !== "string") {
-      throw new HttpError(400, "Environment contains an invalid key or value.");
-    }
-    env[key] = value;
-  }
-  return { name, agent, env };
 }
 
 function computerResponse(computer: Computer, state: DockerState): Record<string, unknown> {

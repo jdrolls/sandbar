@@ -1,9 +1,26 @@
-# Sandbar: make Chromium launchable inside the container (menu, shell, or agent).
-#
-# Docker's default seccomp profile blocks the namespace syscalls Chromium's
-# sandbox needs (even the setuid chrome-sandbox helper fails with EPERM), so
-# every desktop-container project disables the browser sandbox and treats the
-# container itself as the isolation boundary. Verified 2026-07-19.
-# Want the real browser sandbox? Run the container with a seccomp profile that
-# allows user namespaces (see docs) — this flag is harmless either way.
-export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --no-first-run"
+# Sandbar's Chromium launch policy. The default keeps the historical container
+# boundary behavior. Namespace mode is an explicit Platform-provisioned opt-in
+# paired with a narrowly extended Docker seccomp profile.
+case "${SANDBAR_BROWSER_SANDBOX-legacy}" in
+  legacy)
+    export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --no-first-run"
+    ;;
+  namespace)
+    # Do not let a persisted or inherited, whitespace-delimited Chromium flag
+    # silently turn the browser sandbox back off. This blacklist applies only
+    # to CHROMIUM_FLAGS; raw shell invocations are outside this launcher.
+    for sandbar_chromium_flag in $CHROMIUM_FLAGS; do
+      case "$sandbar_chromium_flag" in
+        --no-sandbox|--no-sandbox=*|--disable-setuid-sandbox|--disable-setuid-sandbox=*|--disable-namespace-sandbox|--disable-namespace-sandbox=*|--disable-seccomp-filter-sandbox|--disable-seccomp-filter-sandbox=*|--disable-gpu-sandbox|--disable-gpu-sandbox=*|--no-zygote-sandbox|--no-zygote-sandbox=*|--single-process|--single-process=*)
+          printf '%s\n' "Sandbar refuses sandbox-disabling Chromium flags in namespace mode." >&2
+          exit 1
+          ;;
+      esac
+    done
+    export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-first-run"
+    ;;
+  *)
+    printf '%s\n' "SANDBAR_BROWSER_SANDBOX must be legacy or namespace." >&2
+    exit 1
+    ;;
+esac

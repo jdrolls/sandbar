@@ -1,3 +1,12 @@
+import {
+  assertNamespaceSandboxArchitecture,
+  browserSandboxEnvironmentKey,
+  namespaceBrowserSecurityOpt,
+  NamespaceSandboxPrerequisiteError,
+  namespaceSandboxImageCapability,
+  namespaceSandboxImageCapabilityLabel,
+  parseBrowserSandboxMode,
+} from "./browser-sandbox";
 import { computerPort } from "./ports";
 import { computerResourceLimits, desktopResolutionConfiguration, sandbarNetworkConfiguration } from "./resources";
 import type { Computer } from "./db";
@@ -67,10 +76,57 @@ function jsonRequest(method: string, body?: unknown): RequestInit {
   };
 }
 
+function assertNamespaceSandboxImageCapability(image: unknown): void {
+  const architecture = isRecord(image) ? image.Architecture : undefined;
+  const config = isRecord(image) ? image.Config : undefined;
+  const labels = isRecord(config) ? config.Labels : undefined;
+  const capability = isRecord(labels) ? labels[namespaceSandboxImageCapabilityLabel] : undefined;
+
+  if (architecture !== "amd64") {
+    throw new NamespaceSandboxPrerequisiteError(
+      `Namespace Chromium sandboxing requires an amd64 image; Docker reported ${typeof architecture === "string" ? JSON.stringify(architecture) : "no image architecture"}.`,
+    );
+  }
+  if (capability !== namespaceSandboxImageCapability) {
+    throw new NamespaceSandboxPrerequisiteError(
+      `Namespace Chromium sandboxing requires image label ${namespaceSandboxImageCapabilityLabel}=${namespaceSandboxImageCapability}.`,
+    );
+  }
+}
+
+function assertCanonicalImageId(image: unknown): string {
+  const imageId = isRecord(image) ? image.Id : undefined;
+  if (typeof imageId !== "string" || !/^sha256:[a-f0-9]{64}$/.test(imageId)) {
+    throw new NamespaceSandboxPrerequisiteError(
+      "Namespace Chromium sandboxing requires Docker to report a canonical image Id (sha256:<64 lowercase hexadecimal characters>).",
+    );
+  }
+  return imageId;
+}
+
+async function assertNamespaceSandboxCompatibility(image: string): Promise<string> {
+  const info = await dockerRequest("/info");
+  assertNamespaceSandboxArchitecture(isRecord(info) ? info.Architecture : undefined);
+
+  const inspectedImage = await dockerRequest(`/images/${encodeURIComponent(image)}/json`);
+  assertNamespaceSandboxImageCapability(inspectedImage);
+  return assertCanonicalImageId(inspectedImage);
+}
+
 export type DockerState = "running" | "created" | "exited" | "paused" | "restarting" | "dead" | "unknown" | "missing";
 
 export class DockerDesktop {
   async createAndStart(computer: Computer, createEnv: Readonly<Record<string, string>>): Promise<void> {
+    // Resolve and prove the opt-in before creating any Docker resource. Existing
+    // seats stay on the legacy path and do not incur an extra /info request.
+    const browserSandboxMode = parseBrowserSandboxMode(createEnv[browserSandboxEnvironmentKey]);
+    // Resolve once so the capability inspection and container creation cannot
+    // accidentally target different images if the process environment changes.
+    const configuredImage = process.env.SANDBAR_IMAGE ?? "ghcr.io/jdrolls/sandbar-desktop:latest";
+    const image = browserSandboxMode === "namespace"
+      ? await assertNamespaceSandboxCompatibility(configuredImage)
+      : configuredImage;
+
     const volume = volumeName(computer.id);
     const network = networkName(computer.id);
     let networkCreated = false;
@@ -107,11 +163,14 @@ export class DockerDesktop {
       environment.set("MAX_RES", desktopResolutionConfiguration.maxResolution);
       environment.set("SANDBAR_TOKEN", computer.controlToken);
       environment.set("SANDBAR_AGENT", computer.agent);
+      if (browserSandboxMode === "namespace") {
+        environment.set(browserSandboxEnvironmentKey, "namespace");
+      }
 
       await dockerRequest(
         `/containers/create?name=${encodeURIComponent(containerName(computer.id))}`,
         jsonRequest("POST", {
-          Image: process.env.SANDBAR_IMAGE ?? "ghcr.io/jdrolls/sandbar-desktop:latest",
+          Image: image,
           Env: Array.from(environment, ([key, value]) => `${key}=${value}`),
           ExposedPorts: exposedPorts,
           HostConfig: {
@@ -121,7 +180,9 @@ export class DockerDesktop {
             NanoCpus: computerResourceLimits.nanoCpus,
             Memory: computerResourceLimits.memoryBytes,
             PidsLimit: computerResourceLimits.pidsLimit,
-            SecurityOpt: ["no-new-privileges:true"],
+            SecurityOpt: browserSandboxMode === "namespace"
+              ? ["no-new-privileges:true", namespaceBrowserSecurityOpt()]
+              : ["no-new-privileges:true"],
             RestartPolicy: { Name: "unless-stopped" },
             Mounts: [{ Type: "volume", Source: volume, Target: "/config" }],
           },

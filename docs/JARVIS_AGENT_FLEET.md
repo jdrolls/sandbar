@@ -28,6 +28,8 @@ Initial capacity is **two disposable seats and one persistent seat**. Expansion 
 
 The initial pool uses hardened Docker containers: a distinct bridge network per seat, loopback-only published ports by default (or an intentional Tailscale-only bind), CPU and memory caps, a process limit, and `no-new-privileges`. Desktop containers receive neither host mounts nor a Docker socket. This is the normal lane, not a VM-equivalent trust boundary.
 
+Chromium's namespace sandbox is an optional per-seat prerequisite, not a fleet-wide rollout. A create request may set `SANDBAR_BROWSER_SANDBOX=namespace`; before creating resources, Platform accepts only that explicit mode (or its legacy default), verifies Docker itself reports `x86_64`/`x64`, and inspects the selected local image. The selected image must report `amd64` and carry the fixed `io.sandbar.chromium-sandbox=namespace-v1` compatibility label. Platform does not pull, upgrade, or fall back to a legacy image, then supplies a pinned Docker-default seccomp policy with only the five Chromium namespace rules added. The label proves launcher compatibility only: an operator must still run the runtime Chromium sandbox doctor/smoke check after build or deployment. Existing seats retain legacy Chromium flags and avoid compatibility lookups. This does not authorize `--privileged`, capability additions, AppArmor changes, broad seccomp relaxation, arbitrary capability labels/profile paths, or arbitrary Chromium shell commands.
+
 Escalate a workload when that boundary is insufficient:
 
 1. keep routine, disposable GUI/browser work in the constrained container pool;

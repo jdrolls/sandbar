@@ -1,7 +1,7 @@
 import { isAuthorized, loginCookie, logoutCookie } from "./auth";
-import { HttpError, validateCreate } from "./create-input";
+import { HttpError, mapApiError, validateCreate } from "./create-input";
 import { SandbarDatabase, type Computer } from "./db";
-import { DockerDesktop, DockerError, type DockerState } from "./docker";
+import { DockerDesktop, type DockerState } from "./docker";
 import { dashboardPage, loginPage, type ComputerView } from "./html";
 import { allocatePortBlock, computerPort } from "./ports";
 import { sandbarNetworkConfiguration } from "./resources";
@@ -210,8 +210,8 @@ const server = Bun.serve({
       if (request.method === "POST" && url.pathname === "/logout") return redirect("/", logoutCookie());
       return json({ error: "Not found." }, 404);
     } catch (error) {
-      if (error instanceof HttpError) return json({ error: error.message }, error.status);
-      if (error instanceof DockerError) return json({ error: "Docker operation failed." }, 502);
+      const apiError = mapApiError(error);
+      if (apiError !== undefined) return json({ error: apiError.message }, apiError.status);
       return json({ error: "Internal server error." }, 500);
     }
   },

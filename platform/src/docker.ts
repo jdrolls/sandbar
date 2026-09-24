@@ -2,6 +2,7 @@ import {
   assertNamespaceSandboxArchitecture,
   browserSandboxEnvironmentKey,
   namespaceBrowserSecurityOpt,
+  NamespaceSandboxPrerequisiteError,
   namespaceSandboxImageCapability,
   namespaceSandboxImageCapabilityLabel,
   parseBrowserSandboxMode,
@@ -82,17 +83,21 @@ function assertNamespaceSandboxImageCapability(image: unknown): void {
   const capability = isRecord(labels) ? labels[namespaceSandboxImageCapabilityLabel] : undefined;
 
   if (architecture !== "amd64") {
-    throw new Error(`Namespace Chromium sandboxing requires an amd64 image; Docker reported ${typeof architecture === "string" ? JSON.stringify(architecture) : "no image architecture"}.`);
+    throw new NamespaceSandboxPrerequisiteError(
+      `Namespace Chromium sandboxing requires an amd64 image; Docker reported ${typeof architecture === "string" ? JSON.stringify(architecture) : "no image architecture"}.`,
+    );
   }
   if (capability !== namespaceSandboxImageCapability) {
-    throw new Error(`Namespace Chromium sandboxing requires image label ${namespaceSandboxImageCapabilityLabel}=${namespaceSandboxImageCapability}.`);
+    throw new NamespaceSandboxPrerequisiteError(
+      `Namespace Chromium sandboxing requires image label ${namespaceSandboxImageCapabilityLabel}=${namespaceSandboxImageCapability}.`,
+    );
   }
 }
 
 function assertCanonicalImageId(image: unknown): string {
   const imageId = isRecord(image) ? image.Id : undefined;
   if (typeof imageId !== "string" || !/^sha256:[a-f0-9]{64}$/.test(imageId)) {
-    throw new Error(
+    throw new NamespaceSandboxPrerequisiteError(
       "Namespace Chromium sandboxing requires Docker to report a canonical image Id (sha256:<64 lowercase hexadecimal characters>).",
     );
   }

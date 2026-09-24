@@ -1,4 +1,10 @@
-import { browserSandboxEnvironmentKey, isBrowserSandboxEnvironmentKey, parseBrowserSandboxMode } from "./browser-sandbox";
+import {
+  browserSandboxEnvironmentKey,
+  isBrowserSandboxEnvironmentKey,
+  NamespaceSandboxPrerequisiteError,
+  parseBrowserSandboxMode,
+} from "./browser-sandbox";
+import { DockerError } from "./docker";
 
 const ENVIRONMENT_KEY = /^(?:[A-Z][A-Z0-9_]*_API_KEY|CUSTOM_USER|PASSWORD|SANDBAR_BROWSER_SANDBOX)$/;
 
@@ -12,6 +18,21 @@ export interface CreateInput {
   name: string;
   agent: "hermes" | "none";
   env: Record<string, string>;
+}
+
+/**
+ * Converts known errors to safe API responses without exposing Docker details.
+ */
+export function mapApiError(error: unknown): HttpError | undefined {
+  if (error instanceof HttpError) return error;
+  if (error instanceof NamespaceSandboxPrerequisiteError) {
+    return new HttpError(
+      422,
+      "Namespace browser sandbox prerequisites are not met. Verify Docker and the selected Sandbar image support namespace sandboxing.",
+    );
+  }
+  if (error instanceof DockerError) return new HttpError(502, "Docker operation failed.");
+  return undefined;
 }
 
 /** Validates the JSON fields accepted by POST /api/computers before Docker work. */

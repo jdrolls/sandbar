@@ -5,6 +5,14 @@ export const namespaceSandboxImageCapabilityLabel = "io.sandbar.chromium-sandbox
 export const namespaceSandboxImageCapability = "namespace-v1";
 export type BrowserSandboxMode = "legacy" | "namespace";
 
+/** A namespace-mode configuration prerequisite was not satisfied. */
+export class NamespaceSandboxPrerequisiteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NamespaceSandboxPrerequisiteError";
+  }
+}
+
 interface SeccompArgument {
   index: number;
   value: number;
@@ -43,7 +51,9 @@ export function isBrowserSandboxEnvironmentKey(key: string): boolean {
 
 export function assertNamespaceSandboxArchitecture(architecture: unknown): void {
   if (typeof architecture !== "string" || !namespaceSandboxArchitectures.has(architecture)) {
-    throw new Error(`Namespace Chromium sandboxing is supported only on Docker architectures x86_64 or x64; Docker reported ${typeof architecture === "string" ? JSON.stringify(architecture) : "no architecture"}.`);
+    throw new NamespaceSandboxPrerequisiteError(
+      `Namespace Chromium sandboxing is supported only on Docker architectures x86_64 or x64; Docker reported ${typeof architecture === "string" ? JSON.stringify(architecture) : "no architecture"}.`,
+    );
   }
 }
 

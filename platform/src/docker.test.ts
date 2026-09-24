@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   namespaceBrowserSeccompProfile,
+  NamespaceSandboxPrerequisiteError,
   namespaceSandboxImageCapability,
   namespaceSandboxImageCapabilityLabel,
 } from "./browser-sandbox";
@@ -114,7 +115,7 @@ describe("DockerDesktop namespace browser sandbox opt-in", () => {
 
   test("rejects an unsupported daemon architecture before image lookup or mutations", async () => {
     const requests = installDockerFetch({ daemonArchitecture: "aarch64" });
-    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace" })).rejects.toThrow("x86_64 or x64");
+    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace" })).rejects.toBeInstanceOf(NamespaceSandboxPrerequisiteError);
     expectCompatibilityRefusal(requests, ["/info"]);
   });
 
@@ -129,7 +130,7 @@ describe("DockerDesktop namespace browser sandbox opt-in", () => {
     delete image.Id;
     const requests = installDockerFetch({ image });
 
-    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace" })).rejects.toThrow("canonical image Id");
+    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace" })).rejects.toBeInstanceOf(NamespaceSandboxPrerequisiteError);
     expectCompatibilityRefusal(requests, ["/info", `/images/${encodeURIComponent(defaultImage)}/json`]);
   });
 
@@ -142,7 +143,7 @@ describe("DockerDesktop namespace browser sandbox opt-in", () => {
 
   test("rejects a selected image without the namespace capability label before mutations", async () => {
     const requests = installDockerFetch({ image: { Id: inspectedImageId, Architecture: "amd64", Config: { Labels: {} } } });
-    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace" })).rejects.toThrow(namespaceSandboxImageCapabilityLabel);
+    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace" })).rejects.toBeInstanceOf(NamespaceSandboxPrerequisiteError);
     expectCompatibilityRefusal(requests, ["/info", `/images/${encodeURIComponent(defaultImage)}/json`]);
   });
 

@@ -11,7 +11,7 @@ case "${SANDBAR_BROWSER_SANDBOX-legacy}" in
     # to CHROMIUM_FLAGS; raw shell invocations are outside this launcher.
     for sandbar_chromium_flag in $CHROMIUM_FLAGS; do
       case "$sandbar_chromium_flag" in
-        --no-sandbox|--no-sandbox=*|--disable-setuid-sandbox|--disable-setuid-sandbox=*|--disable-namespace-sandbox|--disable-namespace-sandbox=*|--disable-seccomp-filter-sandbox|--disable-seccomp-filter-sandbox=*|--disable-gpu-sandbox|--disable-gpu-sandbox=*|--no-zygote-sandbox|--no-zygote-sandbox=*|--single-process|--single-process=*)
+        --no-sandbox|--no-sandbox=*|--disable-setuid-sandbox|--disable-setuid-sandbox=*|--disable-namespace-sandbox|--disable-namespace-sandbox=*|--disable-seccomp-filter-sandbox|--disable-seccomp-filter-sandbox=*|--disable-gpu-sandbox|--disable-gpu-sandbox=*|--disable-landlock-sandbox|--disable-landlock-sandbox=*|--no-zygote-sandbox|--no-zygote-sandbox=*|--single-process|--single-process=*)
           printf '%s\n' "Sandbar refuses sandbox-disabling Chromium flags in namespace mode." >&2
           exit 1
           ;;

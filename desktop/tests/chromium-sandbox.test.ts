@@ -46,6 +46,8 @@ describe("Sandbar Chromium launcher policy", () => {
       "--disable-namespace-sandbox",
       "--disable-seccomp-filter-sandbox",
       "--disable-gpu-sandbox",
+      "--disable-landlock-sandbox",
+      "--disable-landlock-sandbox=1",
       "--no-zygote-sandbox",
       "--single-process",
       "--single-process=true",

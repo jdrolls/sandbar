@@ -511,7 +511,7 @@ export class BrowserBridge {
     return blank ?? await attached.context.newPage();
   }
   private async open(args: Record<string, unknown>, newTab: boolean): Promise<Record<string, unknown>> {
-    only(args, newTab ? ["url"] : ["url", "tabId"]); const attached = this.requireAttachment(); const url = this.assertUrl(args.url, attached.origins);
+    only(args, newTab ? ["url"] : ["url", "tabId"]); const attached = this.requireObservation(); const url = this.assertUrl(args.url, attached.origins);
     // An explicit tab id is never allowed to fall back to a different page.
     const page = newTab ? await attached.context.newPage() : args.tabId === undefined ? await this.initialNavigationPage(attached) : this.approvedPage(args.tabId);
     this.pageId(page);

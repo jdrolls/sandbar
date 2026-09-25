@@ -30,6 +30,12 @@ Chromium keeps Sandbar's historical `--no-sandbox` behavior unless a Platform-cr
 
 The image label is a launcher compatibility contract, not evidence that Chromium's runtime sandbox is active. After building or deploying a namespace image, operators must still run the runtime Chromium sandbox doctor/smoke check. Namespace mode is also not a general command-line sanitization boundary: the Sandbar Chromium launcher refuses inherited sandbox-disabling Chromium flags, including `--disable-landlock-sandbox`, in that mode, while arbitrary Chromium invocations through a raw shell remain outside this optional lane. Rejecting that flag does not establish that the installed Chromium has Landlock support enabled or active.
 
+## Shared browser seat image contract
+
+`SANDBAR_SHARED_BROWSER=1` is a Platform-only persistent-seat opt-in and requires `SANDBAR_BROWSER_SANDBOX=namespace`. It additionally requires the distinct image label `io.sandbar.shared-browser=shared-seat-v1`; the older `io.sandbar.chromium-sandbox=namespace-v1` label alone is insufficient. Platform checks both labels and the selected image's immutable Docker ID before creating any Docker resource, so an older namespace image cannot silently enter shared mode.
+
+In shared mode, Sandbar starts exactly one `abc`-owned headed Chromium with its profile at `/config/sandbar-browser` (mode `0700`) and CDP bound to container loopback `127.0.0.1:9222`. It exposes only the Selkies viewer ports 3000 and 3001 on host loopback; ttyd, the raw desktop-control API, and CDP are not published. This image packaging is not a standalone shared-browser product: direct viewer use, public or tailnet exposure, and arbitrary viewer forwarding are unsupported. The viewer boundary is for the approved host-side proxy's WebSocket desktop stream only; authentication, handoff, and browser control belong to the host control plane.
+
 ## Agent adapters
 
 - `SANDBAR_AGENT=hermes` (default) starts Hermes in the chat pane.

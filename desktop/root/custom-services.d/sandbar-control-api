@@ -2,6 +2,12 @@
 # Wait for Webtop's X server and XFCE session before accepting GUI-control requests.
 set -e
 
+# Shared seats expose only the Selkies viewer. Keep the legacy service present
+# for default seats, but run no raw control/bash endpoint in shared mode.
+if [ "${SANDBAR_SHARED_BROWSER:-}" = "1" ]; then
+  exec sleep infinity
+fi
+
 until DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 \
   && pgrep -u abc xfce4-session >/dev/null 2>&1; do
   sleep 1

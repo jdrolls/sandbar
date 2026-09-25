@@ -4,6 +4,8 @@ import {
   NamespaceSandboxPrerequisiteError,
   namespaceSandboxImageCapability,
   namespaceSandboxImageCapabilityLabel,
+  sharedBrowserImageCapability,
+  sharedBrowserImageCapabilityLabel,
 } from "./browser-sandbox";
 import { DockerDesktop } from "./docker";
 import type { Computer } from "./db";
@@ -29,11 +31,16 @@ interface DockerFetchOptions {
   imageStatus?: number;
 }
 
-function compatibleImage(architecture = "amd64", imageId = inspectedImageId): Record<string, unknown> {
+function compatibleImage(architecture = "amd64", imageId = inspectedImageId, sharedBrowser = false): Record<string, unknown> {
   return {
     Id: imageId,
     Architecture: architecture,
-    Config: { Labels: { [namespaceSandboxImageCapabilityLabel]: namespaceSandboxImageCapability } },
+    Config: {
+      Labels: {
+        [namespaceSandboxImageCapabilityLabel]: namespaceSandboxImageCapability,
+        ...(sharedBrowser ? { [sharedBrowserImageCapabilityLabel]: sharedBrowserImageCapability } : {}),
+      },
+    },
   };
 }
 
@@ -101,6 +108,38 @@ describe("DockerDesktop namespace browser sandbox opt-in", () => {
     expect(hostConfig).not.toHaveProperty("CapAdd");
   });
 
+  test("creates a namespace-only shared persistent browser with only loopback viewer ports", async () => {
+    const requests = installDockerFetch({ image: compatibleImage("amd64", inspectedImageId, true) });
+    await new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace", SANDBAR_SHARED_BROWSER: "1" });
+
+    const config = createRequest(requests);
+    expect(config.Env).toContain("SANDBAR_SHARED_BROWSER=1");
+    expect(config.Labels).toEqual({ "io.sandbar.role": "persistent-browser" });
+    expect(config.ExposedPorts).toEqual({ "3000/tcp": {}, "3001/tcp": {} });
+    const bindings = (config.HostConfig as Record<string, unknown>).PortBindings as Record<string, Array<{ HostIp: string }>>;
+    expect(bindings).toEqual({
+      "3000/tcp": [{ HostIp: "127.0.0.1", HostPort: "12000" }],
+      "3001/tcp": [{ HostIp: "127.0.0.1", HostPort: "12001" }],
+    });
+    expect(bindings).not.toHaveProperty("7681/tcp");
+    expect(bindings).not.toHaveProperty("8080/tcp");
+    expect(bindings).not.toHaveProperty("9222/tcp");
+  });
+
+  test("refuses a namespace-capable legacy image for a shared browser before Docker mutation", async () => {
+    const requests = installDockerFetch({ image: compatibleImage() });
+
+    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace", SANDBAR_SHARED_BROWSER: "1" }))
+      .rejects.toThrow(`${sharedBrowserImageCapabilityLabel}=${sharedBrowserImageCapability}`);
+    expectCompatibilityRefusal(requests, ["/info", `/images/${encodeURIComponent(defaultImage)}/json`]);
+  });
+
+  test("refuses a shared browser before Docker mutation unless namespace mode was selected", async () => {
+    const requests = installDockerFetch();
+    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_SHARED_BROWSER: "1" })).rejects.toBeInstanceOf(NamespaceSandboxPrerequisiteError);
+    expect(requests).toEqual([]);
+  });
+
   test("pins namespace creation to the inspected immutable image Id when a mutable tag drifts", async () => {
     const selectedImage = "registry.example/sandbar:latest";
     const immutableImageId = `sha256:${"b".repeat(64)}`;
@@ -160,7 +199,14 @@ describe("DockerDesktop namespace browser sandbox opt-in", () => {
     expect(requests.some(({ path }) => path === "/info" || path.startsWith("/images/"))).toBe(false);
     const config = createRequest(requests);
     expect(config.Env).not.toContain("SANDBAR_BROWSER_SANDBOX=namespace");
+    expect(config.ExposedPorts).toEqual({ "3000/tcp": {}, "3001/tcp": {}, "7681/tcp": {}, "8080/tcp": {} });
     const hostConfig = config.HostConfig as Record<string, unknown>;
+    expect(hostConfig.PortBindings).toEqual({
+      "3000/tcp": [{ HostIp: "127.0.0.1", HostPort: "12000" }],
+      "3001/tcp": [{ HostIp: "127.0.0.1", HostPort: "12001" }],
+      "7681/tcp": [{ HostIp: "127.0.0.1", HostPort: "12002" }],
+      "8080/tcp": [{ HostIp: "127.0.0.1", HostPort: "12003" }],
+    });
     expect(hostConfig.SecurityOpt).toEqual(["no-new-privileges:true"]);
   });
 

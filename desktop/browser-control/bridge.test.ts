@@ -243,6 +243,29 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     expect(adapter.browser.context.page.closed).toBe(0);
   });
 
+  test("requires observation before navigation or tab creation, while preserving observation-only approved navigation", async () => {
+    configured();
+    const zeroObservationAdapter = new FakeAdapter(); const zeroObservation = new BrowserBridge(zeroObservationAdapter);
+    expect(await attach(zeroObservation, false, false, false)).toMatchObject({ ok: true });
+    expect(await zeroObservation.handle(request("open-no-observation", "open", { url: "https://example.test/first" }))).toMatchObject({ ok: false, code: "permission-denied" });
+    expect(await zeroObservation.handle(request("tab-open-no-observation", "tab-open", { url: "https://example.test/second" }))).toMatchObject({ ok: false, code: "permission-denied" });
+    expect(zeroObservationAdapter.browser.context.page.gotoUrls).toEqual([]);
+    expect(zeroObservationAdapter.browser.context.allPages).toHaveLength(1);
+
+    const observationOnlyAdapter = new FakeAdapter(); const observationOnly = new BrowserBridge(observationOnlyAdapter);
+    expect(await attach(observationOnly, false, true, false)).toMatchObject({ ok: true });
+    expect(await observationOnly.handle(request("open-observation-only", "open", { url: "https://example.test/first" }))).toMatchObject({ ok: true });
+    expect(await observationOnly.handle(request("tab-open-observation-only", "tab-open", { url: "https://example.test/second" }))).toMatchObject({ ok: true });
+    expect(observationOnlyAdapter.browser.context.page.gotoUrls).toEqual(["https://example.test/first"]);
+    expect(observationOnlyAdapter.browser.context.allPages).toHaveLength(2);
+    expect(observationOnlyAdapter.browser.context.allPages[1].gotoUrls).toEqual(["https://example.test/second"]);
+
+    expect(await observationOnly.handle(request("open-private-origin", "open", { url: "https://private.test/" }))).toMatchObject({ ok: false, code: "permission-denied" });
+    expect(await observationOnly.handle(request("tab-open-private-origin", "tab-open", { url: "https://private.test/" }))).toMatchObject({ ok: false, code: "permission-denied" });
+    expect(observationOnlyAdapter.browser.context.page.gotoUrls).toEqual(["https://example.test/first"]);
+    expect(observationOnlyAdapter.browser.context.allPages).toHaveLength(2);
+  });
+
   test("uses the initial pristine blank page for the first approved navigation", async () => {
     configured(); const adapter = new FakeAdapter(); adapter.browser.context.page.urlValue = "about:blank"; const bridge = new BrowserBridge(adapter);
     expect(await attach(bridge)).toMatchObject({ ok: true, result: { pageCount: 0 } });

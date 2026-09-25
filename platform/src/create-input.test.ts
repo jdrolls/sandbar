@@ -39,6 +39,18 @@ describe("computer create input validation", () => {
     expectBadRequest({ env: { SANDBAR_BROWSER_SANDBOX: 1 } }, "Environment contains an invalid key or value.");
   });
 
+  test("allows shared browser only as a namespace opt-in", () => {
+    expect(validateCreate({ env: { SANDBAR_BROWSER_SANDBOX: "namespace", SANDBAR_SHARED_BROWSER: "1" } }).env).toEqual({
+      SANDBAR_BROWSER_SANDBOX: "namespace",
+      SANDBAR_SHARED_BROWSER: "1",
+    });
+    expectBadRequest(
+      { env: { SANDBAR_SHARED_BROWSER: "1" } },
+      "SANDBAR_SHARED_BROWSER=1 requires SANDBAR_BROWSER_SANDBOX=namespace.",
+    );
+    expectBadRequest({ env: { SANDBAR_SHARED_BROWSER: "true" } }, 'SANDBAR_SHARED_BROWSER must be "1" when set.');
+  });
+
   test("does not accept callers' Chromium flags or image selection", () => {
     for (const key of ["CHROMIUM_FLAGS", "SANDBAR_IMAGE"]) {
       expectBadRequest({ env: { [key]: "--no-sandbox" } }, "Environment contains an invalid key or value.");

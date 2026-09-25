@@ -2,6 +2,11 @@
 # Start only after Webtop's X server and XFCE session are ready (spike finding 1).
 set -e
 
+# Shared seats expose only the viewer; legacy ttyd remains unchanged otherwise.
+if [ "${SANDBAR_SHARED_BROWSER:-}" = "1" ]; then
+  exec sleep infinity
+fi
+
 # xdotool is installed by this image; unlike xdpyinfo it is guaranteed to exist here.
 until DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 \
   && pgrep -u abc xfce4-session >/dev/null 2>&1; do

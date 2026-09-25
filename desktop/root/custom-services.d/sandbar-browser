@@ -1,0 +1,54 @@
+#!/usr/bin/with-contenv bash
+# The shared-seat browser is deliberately a separate s6 service: it owns one
+# headed Chromium, while the Node bridge only attaches over container loopback.
+set -euo pipefail
+set -f # CHROMIUM_FLAGS is inspected, never shell-expanded into launch arguments.
+
+# Keep this service inert for byte-compatible legacy seats. A sleeping service
+# avoids s6 restart churn while starting no browser or listener.
+if [[ "${SANDBAR_SHARED_BROWSER:-}" != "1" ]]; then
+  exec sleep infinity
+fi
+
+if [[ "${SANDBAR_BROWSER_SANDBOX:-}" != "namespace" ]]; then
+  printf '%s\n' "SANDBAR_SHARED_BROWSER=1 requires SANDBAR_BROWSER_SANDBOX=namespace." >&2
+  exit 1
+fi
+
+# Never inherit launcher arguments into the fixed CDP process. Rejecting known
+# sandbox-disabling flags also makes a poisoned persisted environment fail loud.
+for sandbar_chromium_flag in ${CHROMIUM_FLAGS:-}; do
+  case "$sandbar_chromium_flag" in
+    --no-sandbox|--no-sandbox=*|--disable-setuid-sandbox|--disable-setuid-sandbox=*|--disable-namespace-sandbox|--disable-namespace-sandbox=*|--disable-seccomp-filter-sandbox|--disable-seccomp-filter-sandbox=*|--disable-gpu-sandbox|--disable-gpu-sandbox=*|--disable-landlock-sandbox|--disable-landlock-sandbox=*|--no-zygote-sandbox|--no-zygote-sandbox=*|--single-process|--single-process=*)
+      printf '%s\n' "Sandbar shared browser refuses sandbox-disabling Chromium flags." >&2
+      exit 1
+      ;;
+  esac
+done
+
+until DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 \
+  && pgrep -u abc xfce4-session >/dev/null 2>&1; do
+  sleep 1
+done
+
+# Do not silently add a second persistent browser after a service restart.
+if pgrep -u abc -x chromium >/dev/null 2>&1; then
+  printf '%s\n' "Sandbar shared browser found an existing abc Chromium process." >&2
+  exit 1
+fi
+
+# The persistent profile may contain browser session state; do not inherit the
+# volume's default directory mode or leave it readable by other container users.
+install -d -m 0700 -o abc -g abc /config/sandbar-browser
+chromium_bin="$(command -v chromium)"
+if [[ -z "$chromium_bin" ]]; then
+  printf '%s\n' "Sandbar shared browser cannot find Chromium." >&2
+  exit 1
+fi
+
+exec s6-setuidgid abc env HOME=/config DISPLAY=:1 "$chromium_bin" \
+  --user-data-dir=/config/sandbar-browser \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --no-first-run \
+  --no-default-browser-check

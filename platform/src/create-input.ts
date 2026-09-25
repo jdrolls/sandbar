@@ -1,12 +1,15 @@
 import {
   browserSandboxEnvironmentKey,
   isBrowserSandboxEnvironmentKey,
+  isSharedBrowserEnvironmentKey,
   NamespaceSandboxPrerequisiteError,
   parseBrowserSandboxMode,
+  parseSharedBrowserOptIn,
+  sharedBrowserEnvironmentKey,
 } from "./browser-sandbox";
 import { DockerError } from "./docker";
 
-const ENVIRONMENT_KEY = /^(?:[A-Z][A-Z0-9_]*_API_KEY|CUSTOM_USER|PASSWORD|SANDBAR_BROWSER_SANDBOX)$/;
+const ENVIRONMENT_KEY = /^(?:[A-Z][A-Z0-9_]*_API_KEY|CUSTOM_USER|PASSWORD|SANDBAR_BROWSER_SANDBOX|SANDBAR_SHARED_BROWSER)$/;
 
 export class HttpError extends Error {
   constructor(readonly status: number, message: string) {
@@ -58,7 +61,17 @@ export function validateCreate(body: Record<string, unknown>): CreateInput {
         throw new HttpError(400, `${browserSandboxEnvironmentKey} must be "legacy" or "namespace".`);
       }
     }
+    if (isSharedBrowserEnvironmentKey(key)) {
+      try {
+        parseSharedBrowserOptIn(value);
+      } catch {
+        throw new HttpError(400, `${sharedBrowserEnvironmentKey} must be "1" when set.`);
+      }
+    }
     env[key] = value;
+  }
+  if (parseSharedBrowserOptIn(env[sharedBrowserEnvironmentKey]) && parseBrowserSandboxMode(env[browserSandboxEnvironmentKey]) !== "namespace") {
+    throw new HttpError(400, `${sharedBrowserEnvironmentKey}=1 requires ${browserSandboxEnvironmentKey}=namespace.`);
   }
   return { name, agent, env };
 }

@@ -7,6 +7,10 @@ import {
   namespaceSandboxImageCapability,
   namespaceSandboxImageCapabilityLabel,
   parseBrowserSandboxMode,
+  parseSharedBrowserOptIn,
+  sharedBrowserEnvironmentKey,
+  sharedBrowserImageCapability,
+  sharedBrowserImageCapabilityLabel,
 } from "./browser-sandbox";
 
 const expectedAdditions = [
@@ -18,9 +22,13 @@ const expectedAdditions = [
 ];
 
 describe("namespace browser sandbox policy", () => {
-  test("uses a fixed image capability contract", () => {
+  test("uses distinct fixed namespace and shared-seat image capability contracts", () => {
     expect(namespaceSandboxImageCapabilityLabel).toBe("io.sandbar.chromium-sandbox");
     expect(namespaceSandboxImageCapability).toBe("namespace-v1");
+    expect(sharedBrowserImageCapabilityLabel).toBe("io.sandbar.shared-browser");
+    expect(sharedBrowserImageCapability).toBe("shared-seat-v1");
+    expect(sharedBrowserImageCapabilityLabel).not.toBe(namespaceSandboxImageCapabilityLabel);
+    expect(sharedBrowserImageCapability).not.toBe(namespaceSandboxImageCapability);
   });
 
   test("pins the raw vendored profile to Docker's upstream Git blob", async () => {
@@ -49,6 +57,14 @@ describe("namespace browser sandbox policy", () => {
     expect(parseBrowserSandboxMode("namespace")).toBe("namespace");
     for (const invalid of ["", "default", "Namespace", "enabled", "namespace "]) {
       expect(() => parseBrowserSandboxMode(invalid)).toThrow("SANDBAR_BROWSER_SANDBOX");
+    }
+  });
+
+  test("accepts only the explicit shared-browser opt-in", () => {
+    expect(parseSharedBrowserOptIn(undefined)).toBe(false);
+    expect(parseSharedBrowserOptIn("1")).toBe(true);
+    for (const invalid of ["", "0", "true", " 1"]) {
+      expect(() => parseSharedBrowserOptIn(invalid)).toThrow(sharedBrowserEnvironmentKey);
     }
   });
 

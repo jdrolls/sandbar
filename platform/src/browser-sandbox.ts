@@ -1,8 +1,13 @@
 import dockerDefaultSeccomp from "./seccomp/docker-default.json" with { type: "json" };
 
 export const browserSandboxEnvironmentKey = "SANDBAR_BROWSER_SANDBOX";
+export const sharedBrowserEnvironmentKey = "SANDBAR_SHARED_BROWSER";
 export const namespaceSandboxImageCapabilityLabel = "io.sandbar.chromium-sandbox";
 export const namespaceSandboxImageCapability = "namespace-v1";
+// This is deliberately separate from the namespace launcher capability. A
+// namespace-capable legacy image must not be allowed to start shared mode.
+export const sharedBrowserImageCapabilityLabel = "io.sandbar.shared-browser";
+export const sharedBrowserImageCapability = "shared-seat-v1";
 export type BrowserSandboxMode = "legacy" | "namespace";
 
 /** A namespace-mode configuration prerequisite was not satisfied. */
@@ -47,6 +52,17 @@ export function parseBrowserSandboxMode(value: string | undefined): BrowserSandb
 
 export function isBrowserSandboxEnvironmentKey(key: string): boolean {
   return key === browserSandboxEnvironmentKey;
+}
+
+/** Shared persistent browser seats are an explicit, one-way opt-in. */
+export function parseSharedBrowserOptIn(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  if (value === "1") return true;
+  throw new Error(`${sharedBrowserEnvironmentKey} must be "1" when set.`);
+}
+
+export function isSharedBrowserEnvironmentKey(key: string): boolean {
+  return key === sharedBrowserEnvironmentKey;
 }
 
 export function assertNamespaceSandboxArchitecture(architecture: unknown): void {

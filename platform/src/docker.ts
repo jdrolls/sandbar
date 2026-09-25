@@ -6,6 +6,10 @@ import {
   namespaceSandboxImageCapability,
   namespaceSandboxImageCapabilityLabel,
   parseBrowserSandboxMode,
+  parseSharedBrowserOptIn,
+  sharedBrowserEnvironmentKey,
+  sharedBrowserImageCapability,
+  sharedBrowserImageCapabilityLabel,
 } from "./browser-sandbox";
 import { computerPort } from "./ports";
 import { computerResourceLimits, desktopResolutionConfiguration, sandbarNetworkConfiguration } from "./resources";
@@ -76,20 +80,26 @@ function jsonRequest(method: string, body?: unknown): RequestInit {
   };
 }
 
-function assertNamespaceSandboxImageCapability(image: unknown): void {
+function assertNamespaceSandboxImageCapability(image: unknown, sharedBrowser: boolean): void {
   const architecture = isRecord(image) ? image.Architecture : undefined;
   const config = isRecord(image) ? image.Config : undefined;
   const labels = isRecord(config) ? config.Labels : undefined;
-  const capability = isRecord(labels) ? labels[namespaceSandboxImageCapabilityLabel] : undefined;
+  const namespaceCapability = isRecord(labels) ? labels[namespaceSandboxImageCapabilityLabel] : undefined;
+  const sharedCapability = isRecord(labels) ? labels[sharedBrowserImageCapabilityLabel] : undefined;
 
   if (architecture !== "amd64") {
     throw new NamespaceSandboxPrerequisiteError(
       `Namespace Chromium sandboxing requires an amd64 image; Docker reported ${typeof architecture === "string" ? JSON.stringify(architecture) : "no image architecture"}.`,
     );
   }
-  if (capability !== namespaceSandboxImageCapability) {
+  if (namespaceCapability !== namespaceSandboxImageCapability) {
     throw new NamespaceSandboxPrerequisiteError(
       `Namespace Chromium sandboxing requires image label ${namespaceSandboxImageCapabilityLabel}=${namespaceSandboxImageCapability}.`,
+    );
+  }
+  if (sharedBrowser && sharedCapability !== sharedBrowserImageCapability) {
+    throw new NamespaceSandboxPrerequisiteError(
+      `Shared browser seats require image label ${sharedBrowserImageCapabilityLabel}=${sharedBrowserImageCapability}.`,
     );
   }
 }
@@ -104,12 +114,12 @@ function assertCanonicalImageId(image: unknown): string {
   return imageId;
 }
 
-async function assertNamespaceSandboxCompatibility(image: string): Promise<string> {
+async function assertNamespaceSandboxCompatibility(image: string, sharedBrowser: boolean): Promise<string> {
   const info = await dockerRequest("/info");
   assertNamespaceSandboxArchitecture(isRecord(info) ? info.Architecture : undefined);
 
   const inspectedImage = await dockerRequest(`/images/${encodeURIComponent(image)}/json`);
-  assertNamespaceSandboxImageCapability(inspectedImage);
+  assertNamespaceSandboxImageCapability(inspectedImage, sharedBrowser);
   return assertCanonicalImageId(inspectedImage);
 }
 
@@ -120,11 +130,15 @@ export class DockerDesktop {
     // Resolve and prove the opt-in before creating any Docker resource. Existing
     // seats stay on the legacy path and do not incur an extra /info request.
     const browserSandboxMode = parseBrowserSandboxMode(createEnv[browserSandboxEnvironmentKey]);
+    const sharedBrowser = parseSharedBrowserOptIn(createEnv[sharedBrowserEnvironmentKey]);
+    if (sharedBrowser && browserSandboxMode !== "namespace") {
+      throw new NamespaceSandboxPrerequisiteError("Shared browser seats require namespace browser sandboxing.");
+    }
     // Resolve once so the capability inspection and container creation cannot
     // accidentally target different images if the process environment changes.
     const configuredImage = process.env.SANDBAR_IMAGE ?? "ghcr.io/jdrolls/sandbar-desktop:latest";
     const image = browserSandboxMode === "namespace"
-      ? await assertNamespaceSandboxCompatibility(configuredImage)
+      ? await assertNamespaceSandboxCompatibility(configuredImage, sharedBrowser)
       : configuredImage;
 
     const volume = volumeName(computer.id);
@@ -146,14 +160,21 @@ export class DockerDesktop {
       await dockerRequest("/volumes/create", jsonRequest("POST", { Name: volume }));
       volumeCreated = true;
 
-      const bindings: Record<string, Array<{ HostIp: string; HostPort: string }>> = {
-        "3000/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.desktopHttp(computer.basePort)) }],
-        "3001/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.desktopHttps(computer.basePort)) }],
-        "7681/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.chat(computer.basePort)) }],
-        "8080/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.control(computer.basePort)) }],
-      };
+      // The shared persistent browser has only a local viewer surface. It never
+      // inherits a tailnet bind and never publishes ttyd, control API, or CDP.
+      const bindings: Record<string, Array<{ HostIp: string; HostPort: string }>> = sharedBrowser
+        ? {
+          "3000/tcp": [{ HostIp: "127.0.0.1", HostPort: String(computerPort.desktopHttp(computer.basePort)) }],
+          "3001/tcp": [{ HostIp: "127.0.0.1", HostPort: String(computerPort.desktopHttps(computer.basePort)) }],
+        }
+        : {
+          "3000/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.desktopHttp(computer.basePort)) }],
+          "3001/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.desktopHttps(computer.basePort)) }],
+          "7681/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.chat(computer.basePort)) }],
+          "8080/tcp": [{ HostIp: sandbarNetworkConfiguration.bindIp, HostPort: String(computerPort.control(computer.basePort)) }],
+        };
       const exposedPorts: Record<string, Record<string, never>> = Object.fromEntries(
-        DESKTOP_PORTS.map((port) => [port, {}]),
+        (sharedBrowser ? ["3000/tcp", "3001/tcp"] : DESKTOP_PORTS).map((port) => [port, {}]),
       );
       const environment = new Map<string, string>(Object.entries(createEnv));
       // Configure Selkies at container creation. MAX_RES blocks a connected
@@ -166,12 +187,16 @@ export class DockerDesktop {
       if (browserSandboxMode === "namespace") {
         environment.set(browserSandboxEnvironmentKey, "namespace");
       }
+      if (sharedBrowser) {
+        environment.set(sharedBrowserEnvironmentKey, "1");
+      }
 
       await dockerRequest(
         `/containers/create?name=${encodeURIComponent(containerName(computer.id))}`,
         jsonRequest("POST", {
           Image: image,
           Env: Array.from(environment, ([key, value]) => `${key}=${value}`),
+          Labels: sharedBrowser ? { "io.sandbar.role": "persistent-browser" } : undefined,
           ExposedPorts: exposedPorts,
           HostConfig: {
             NetworkMode: network,

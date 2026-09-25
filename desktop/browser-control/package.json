@@ -1,0 +1,16 @@
+{
+  "name": "sandbar-browser-bridge",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "bun build bridge.ts --target=node --external=playwright-core --outfile dist/bridge.mjs",
+    "test": "bun test bridge.test.ts native-input.contract.test.ts"
+  },
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  },
+  "engines": {
+    "node": "22.22.0"
+  }
+}

@@ -1,0 +1,88 @@
+#!/usr/bin/with-contenv bash
+# Shared seats replace Selkies' vendor run only after their explicit, validated
+# opt-in. Ordinary desktops never reach the install path, so their vendor run
+# stays exactly as supplied by Webtop.
+set -euo pipefail
+
+shared_run=/etc/sandbar/selkies-shared-run
+selkies_run=/etc/s6-overlay/s6-rc.d/svc-selkies/run
+
+disable_vendor_run() {
+  # Do not follow a replaced run symlink. If staging a fixed failing run is
+  # impossible, remove the link or remove execute permission from the exact
+  # run entry so s6 cannot invoke the vendor service.
+  if [ -L "$selkies_run" ]; then
+    /bin/rm -f -- "$selkies_run"
+  elif [ -e "$selkies_run" ]; then
+    /bin/chmod 000 -- "$selkies_run"
+  fi
+}
+
+install_failing_run() {
+  # s6 can start its vendor service after this init hook exits, so an init
+  # failure alone is not a service stop. Stage a root-owned fixed failure in
+  # the service directory and atomically replace the run entry; mv replaces a
+  # final-component symlink rather than following it.
+  local service_dir=${selkies_run%/*}
+  local staged_run
+
+  if [ ! -L "$service_dir" ] && [ -d "$service_dir" ]; then
+    staged_run=$(/usr/bin/mktemp "$service_dir/.sandbar-selkies-disabled.XXXXXX") || staged_run=
+    if [ -n "$staged_run" ] \
+      && {
+        printf '%s\n' '#!/usr/bin/with-contenv bash'
+        printf '%s\n' 'printf "%s\\n" "Sandbar shared viewer service disabled during initialization." >&2'
+        printf '%s\n' 'exit 1'
+      } > "$staged_run" \
+      && /bin/chown root:root "$staged_run" \
+      && /bin/chmod 0755 "$staged_run" \
+      && /bin/mv -fT -- "$staged_run" "$selkies_run"; then
+      return 0
+    fi
+    [ -z "$staged_run" ] || /bin/rm -f -- "$staged_run"
+  fi
+
+  disable_vendor_run
+}
+
+fail() {
+  printf '%s\n' "Sandbar shared viewer initialization failed: $1" >&2
+  if ! install_failing_run; then
+    printf '%s\n' 'Sandbar shared viewer could not install the failing Selkies run.' >&2
+  fi
+  exit 1
+}
+
+case "${SANDBAR_SHARED_BROWSER-}" in
+  "")
+    exit 0
+    ;;
+  1)
+    ;;
+  *)
+    fail 'SANDBAR_SHARED_BROWSER must be exactly "1" when set.'
+    ;;
+esac
+
+# Dev mode may replace or augment vendor services, which would undermine the
+# fixed websocket-only invocation installed below.
+if [[ -v DEV_MODE ]]; then
+  fail "DEV_MODE is not supported for a shared viewer seat."
+fi
+
+if [[ "${SANDBAR_BROWSER_SANDBOX-}" != "namespace" ]]; then
+  fail "SANDBAR_SHARED_BROWSER=1 requires SANDBAR_BROWSER_SANDBOX=namespace."
+fi
+
+require_trusted_executable() {
+  local path=$1
+  [ -f "$path" ] && [ ! -L "$path" ] && [ -x "$path" ] || fail "unsafe or missing prerequisite $path"
+  [ "$(/usr/bin/stat -c '%u:%g' "$path")" = "0:0" ] || fail "unsafe ownership for $path"
+}
+
+# Do not follow a replaced service file or install an untrusted runner. A bad
+# image overlay must stop startup rather than falling back to vendor Selkies.
+require_trusted_executable "$shared_run"
+require_trusted_executable "$selkies_run"
+
+/usr/bin/install -o root -g root -m 0755 "$shared_run" "$selkies_run" || fail "could not install the shared viewer runner"

@@ -1,0 +1,53 @@
+#!/usr/bin/with-contenv bash
+# Fixed Selkies transport for SANDBAR_SHARED_BROWSER=1. This runner is copied
+# over Webtop's service only by 86-sandbar-shared-viewer after fail-closed
+# prerequisite checks; it is not a second service.
+set -euo pipefail
+
+fail() {
+  printf '%s\n' "Sandbar shared viewer failed: $1" >&2
+  exit 1
+}
+
+if [[ "${SANDBAR_SHARED_BROWSER-}" != "1" ]]; then
+  fail 'SANDBAR_SHARED_BROWSER must be exactly "1".'
+fi
+if [[ -v DEV_MODE ]]; then
+  fail "DEV_MODE is not supported for a shared viewer seat."
+fi
+if [[ "${SANDBAR_BROWSER_SANDBOX-}" != "namespace" ]]; then
+  fail "SANDBAR_SHARED_BROWSER=1 requires SANDBAR_BROWSER_SANDBOX=namespace."
+fi
+
+# Keep Webtop's cursor and audio preparation when taking ownership of the
+# Selkies run file. Audio is an optional enhancement: unavailable PulseAudio
+# must not prevent the desktop stream from starting.
+export XCURSOR_THEME=breeze_cursors
+if [[ ! -e /dev/shm/audio.lock ]]; then
+  : "${PULSE_SERVER:=unix:/tmp/pulse-socket}"
+  export PULSE_SERVER
+
+  audio_ready=false
+  for _ in {1..10}; do
+    if s6-setuidgid abc with-contenv pactl info >/dev/null 2>&1; then
+      if s6-setuidgid abc with-contenv pactl load-module module-null-sink \
+        sink_name=output sink_properties=device.description=Output >/dev/null 2>&1 \
+        && s6-setuidgid abc with-contenv pactl load-module module-null-sink \
+          sink_name=input sink_properties=device.description=Input >/dev/null 2>&1; then
+        touch /dev/shm/audio.lock
+        audio_ready=true
+      fi
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ "$audio_ready" != true ]]; then
+    printf '%s\n' "Sandbar shared viewer: PulseAudio sinks unavailable; continuing without audio sinks." >&2
+  fi
+fi
+
+exec s6-setuidgid abc /lsiopy/bin/python3 -m selkies \
+  --addr=localhost \
+  --mode=websockets \
+  --enable-dual-mode='false|locked'

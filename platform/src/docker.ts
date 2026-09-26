@@ -10,6 +10,8 @@ import {
   sharedBrowserEnvironmentKey,
   sharedBrowserImageCapability,
   sharedBrowserImageCapabilityLabel,
+  sharedViewerImageCapability,
+  sharedViewerImageCapabilityLabel,
 } from "./browser-sandbox";
 import { computerPort } from "./ports";
 import { computerResourceLimits, desktopResolutionConfiguration, sandbarNetworkConfiguration } from "./resources";
@@ -85,7 +87,8 @@ function assertNamespaceSandboxImageCapability(image: unknown, sharedBrowser: bo
   const config = isRecord(image) ? image.Config : undefined;
   const labels = isRecord(config) ? config.Labels : undefined;
   const namespaceCapability = isRecord(labels) ? labels[namespaceSandboxImageCapabilityLabel] : undefined;
-  const sharedCapability = isRecord(labels) ? labels[sharedBrowserImageCapabilityLabel] : undefined;
+  const sharedBrowserCapability = isRecord(labels) ? labels[sharedBrowserImageCapabilityLabel] : undefined;
+  const sharedViewerCapability = isRecord(labels) ? labels[sharedViewerImageCapabilityLabel] : undefined;
 
   if (architecture !== "amd64") {
     throw new NamespaceSandboxPrerequisiteError(
@@ -97,9 +100,14 @@ function assertNamespaceSandboxImageCapability(image: unknown, sharedBrowser: bo
       `Namespace Chromium sandboxing requires image label ${namespaceSandboxImageCapabilityLabel}=${namespaceSandboxImageCapability}.`,
     );
   }
-  if (sharedBrowser && sharedCapability !== sharedBrowserImageCapability) {
+  if (sharedBrowser && sharedBrowserCapability !== sharedBrowserImageCapability) {
     throw new NamespaceSandboxPrerequisiteError(
       `Shared browser seats require image label ${sharedBrowserImageCapabilityLabel}=${sharedBrowserImageCapability}.`,
+    );
+  }
+  if (sharedBrowser && sharedViewerCapability !== sharedViewerImageCapability) {
+    throw new NamespaceSandboxPrerequisiteError(
+      `Shared browser seats require image label ${sharedViewerImageCapabilityLabel}=${sharedViewerImageCapability}.`,
     );
   }
 }

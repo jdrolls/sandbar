@@ -6,6 +6,8 @@ import {
   namespaceSandboxImageCapabilityLabel,
   sharedBrowserImageCapability,
   sharedBrowserImageCapabilityLabel,
+  sharedViewerImageCapability,
+  sharedViewerImageCapabilityLabel,
 } from "./browser-sandbox";
 import { DockerDesktop } from "./docker";
 import type { Computer } from "./db";
@@ -31,17 +33,22 @@ interface DockerFetchOptions {
   imageStatus?: number;
 }
 
-function compatibleImage(architecture = "amd64", imageId = inspectedImageId, sharedBrowser = false): Record<string, unknown> {
+function compatibleImage(architecture = "amd64", imageId = inspectedImageId): Record<string, unknown> {
   return {
     Id: imageId,
     Architecture: architecture,
     Config: {
       Labels: {
         [namespaceSandboxImageCapabilityLabel]: namespaceSandboxImageCapability,
-        ...(sharedBrowser ? { [sharedBrowserImageCapabilityLabel]: sharedBrowserImageCapability } : {}),
+        [sharedBrowserImageCapabilityLabel]: sharedBrowserImageCapability,
+        [sharedViewerImageCapabilityLabel]: sharedViewerImageCapability,
       },
     },
   };
+}
+
+function imageLabels(image: Record<string, unknown>): Record<string, unknown> {
+  return (image.Config as { Labels: Record<string, unknown> }).Labels;
 }
 
 afterEach(() => {
@@ -109,7 +116,13 @@ describe("DockerDesktop namespace browser sandbox opt-in", () => {
   });
 
   test("creates a namespace-only shared persistent browser with only loopback viewer ports", async () => {
-    const requests = installDockerFetch({ image: compatibleImage("amd64", inspectedImageId, true) });
+    const image = compatibleImage();
+    expect(imageLabels(image)).toEqual({
+      [namespaceSandboxImageCapabilityLabel]: namespaceSandboxImageCapability,
+      [sharedBrowserImageCapabilityLabel]: sharedBrowserImageCapability,
+      [sharedViewerImageCapabilityLabel]: sharedViewerImageCapability,
+    });
+    const requests = installDockerFetch({ image });
     await new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace", SANDBAR_SHARED_BROWSER: "1" });
 
     const config = createRequest(requests);
@@ -126,11 +139,23 @@ describe("DockerDesktop namespace browser sandbox opt-in", () => {
     expect(bindings).not.toHaveProperty("9222/tcp");
   });
 
-  test("refuses a namespace-capable legacy image for a shared browser before Docker mutation", async () => {
-    const requests = installDockerFetch({ image: compatibleImage() });
+  test("refuses a shared browser missing the browser capability before Docker mutation", async () => {
+    const image = compatibleImage();
+    delete imageLabels(image)[sharedBrowserImageCapabilityLabel];
+    const requests = installDockerFetch({ image });
 
     await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace", SANDBAR_SHARED_BROWSER: "1" }))
       .rejects.toThrow(`${sharedBrowserImageCapabilityLabel}=${sharedBrowserImageCapability}`);
+    expectCompatibilityRefusal(requests, ["/info", `/images/${encodeURIComponent(defaultImage)}/json`]);
+  });
+
+  test("refuses a shared browser missing the viewer capability before Docker mutation", async () => {
+    const image = compatibleImage();
+    delete imageLabels(image)[sharedViewerImageCapabilityLabel];
+    const requests = installDockerFetch({ image });
+
+    await expect(new DockerDesktop().createAndStart(computer, { SANDBAR_BROWSER_SANDBOX: "namespace", SANDBAR_SHARED_BROWSER: "1" }))
+      .rejects.toThrow(`${sharedViewerImageCapabilityLabel}=${sharedViewerImageCapability}`);
     expectCompatibilityRefusal(requests, ["/info", `/images/${encodeURIComponent(defaultImage)}/json`]);
   });
 

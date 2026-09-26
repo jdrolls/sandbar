@@ -11,6 +11,8 @@ import {
   sharedBrowserEnvironmentKey,
   sharedBrowserImageCapability,
   sharedBrowserImageCapabilityLabel,
+  sharedViewerImageCapability,
+  sharedViewerImageCapabilityLabel,
 } from "./browser-sandbox";
 
 const expectedAdditions = [
@@ -22,13 +24,23 @@ const expectedAdditions = [
 ];
 
 describe("namespace browser sandbox policy", () => {
-  test("uses distinct fixed namespace and shared-seat image capability contracts", () => {
+  test("uses independent fixed namespace, shared-browser, and shared-viewer capability contracts", () => {
     expect(namespaceSandboxImageCapabilityLabel).toBe("io.sandbar.chromium-sandbox");
     expect(namespaceSandboxImageCapability).toBe("namespace-v1");
     expect(sharedBrowserImageCapabilityLabel).toBe("io.sandbar.shared-browser");
     expect(sharedBrowserImageCapability).toBe("shared-seat-v1");
-    expect(sharedBrowserImageCapabilityLabel).not.toBe(namespaceSandboxImageCapabilityLabel);
-    expect(sharedBrowserImageCapability).not.toBe(namespaceSandboxImageCapability);
+    expect(sharedViewerImageCapabilityLabel).toBe("io.sandbar.shared-viewer");
+    expect(sharedViewerImageCapability).toBe("viewer-lock-v1");
+    expect(new Set([
+      namespaceSandboxImageCapabilityLabel,
+      sharedBrowserImageCapabilityLabel,
+      sharedViewerImageCapabilityLabel,
+    ]).size).toBe(3);
+    expect(new Set([
+      namespaceSandboxImageCapability,
+      sharedBrowserImageCapability,
+      sharedViewerImageCapability,
+    ]).size).toBe(3);
   });
 
   test("pins the raw vendored profile to Docker's upstream Git blob", async () => {

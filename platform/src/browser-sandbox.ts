@@ -8,6 +8,10 @@ export const namespaceSandboxImageCapability = "namespace-v1";
 // namespace-capable legacy image must not be allowed to start shared mode.
 export const sharedBrowserImageCapabilityLabel = "io.sandbar.shared-browser";
 export const sharedBrowserImageCapability = "shared-seat-v1";
+// Locked-viewer support is a separate capability from the shared browser seat.
+// Shared mode requires both contracts so neither legacy image is accepted alone.
+export const sharedViewerImageCapabilityLabel = "io.sandbar.shared-viewer";
+export const sharedViewerImageCapability = "viewer-lock-v1";
 export type BrowserSandboxMode = "legacy" | "namespace";
 
 /** A namespace-mode configuration prerequisite was not satisfied. */

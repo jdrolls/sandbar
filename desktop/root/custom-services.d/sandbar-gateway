@@ -1,0 +1,69 @@
+#!/usr/bin/with-contenv bash
+# Static, root-supervised slot for Hermes' messaging gateway. Hermes' own
+# dynamic slot registration assumes the official image's uid 10000 and a
+# writable /run/service, neither of which exists on this lsio base (abc, 911).
+set -euo pipefail
+
+# Shared seats expose only the viewer; a BYO-agent seat has no Hermes to supervise.
+if [[ "${SANDBAR_SHARED_BROWSER:-}" == "1" || "${SANDBAR_AGENT:-hermes}" == "none" ]]; then
+  exec sleep infinity
+fi
+
+hermes_home=/config/.hermes
+venv=/usr/local/lib/hermes-agent/venv
+
+# A gateway is "configured" when a messaging bot token exists in the container
+# environment or in Hermes' persisted .env. SANDBAR_GATEWAY=0/1 overrides this.
+# The default is deliberately off: a Hermes without a gateway config would only
+# crash-loop under s6.
+gateway_configured() {
+  case "${SANDBAR_GATEWAY:-}" in
+    0) return 1 ;;
+    1) return 0 ;;
+  esac
+  local name
+  for name in $(compgen -e); do
+    [[ "$name" == *_BOT_TOKEN && -n "${!name}" ]] && return 0
+  done
+  # A quoted empty value (TOKEN="") is not a token.
+  [[ -f "$hermes_home/.env" ]] \
+    && grep -Eq '^[[:space:]]*(export[[:space:]]+)?[A-Za-z0-9_]+_BOT_TOKEN=[[:space:]]*[^"'"'"'[:space:]#]' "$hermes_home/.env" \
+    && return 0
+  return 1
+}
+
+# SANDBAR_GATEWAY=0 is final; otherwise wait, so a token added later (hermes
+# setup) starts the gateway without a container restart.
+if [[ "${SANDBAR_GATEWAY:-}" == "0" ]]; then
+  exec sleep infinity
+fi
+until gateway_configured; do
+  sleep 15
+done
+
+if [[ ! -x "$venv/bin/hermes" ]]; then
+  printf '%s\n' "Sandbar gateway cannot find $venv/bin/hermes." >&2
+  exec sleep infinity
+fi
+
+# The hermes wrapper unsets PYTHONPATH, so vendored deps (no pip in the venv)
+# are exposed through a .pth, which site.py honors regardless. Rewrite it only
+# when it differs, so restarts are idempotent.
+pth_content=$'/config/.hermes/telegram_vendor\n/config/.hermes/vendor\n'
+for site_packages in "$venv"/lib/python3*/site-packages; do
+  [[ -d "$site_packages" ]] || continue
+  pth="$site_packages/sandbar-hermes-vendor.pth"
+  # A failed heal must not keep the gateway down; it just lacks vendored deps.
+  if [[ "$(cat "$pth" 2>/dev/null || true)" != "${pth_content%$'\n'}" ]]; then
+    printf '%s' "$pth_content" > "$pth" || printf '%s\n' "Sandbar gateway could not write $pth." >&2
+  fi
+  chmod 0644 "$pth" 2>/dev/null || true
+done
+
+export HOME=/config
+export USER=abc
+export DISPLAY=:1
+export PATH=/config/.local/bin:$PATH
+# Run the gateway loop directly instead of dispatching to a (nonexistent) slot.
+export HERMES_S6_SUPERVISED_CHILD=1
+exec s6-setuidgid abc "$venv/bin/hermes" gateway run --replace

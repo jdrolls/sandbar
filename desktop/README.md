@@ -43,6 +43,14 @@ In shared mode, Sandbar starts exactly one `abc`-owned headed Chromium with its 
 - `SANDBAR_AGENT=hermes` (default) starts Hermes in the chat pane.
 - `SANDBAR_AGENT=none` makes the chat pane a plain shell. Pair it with `SANDBAR_TOKEN` and the control API on port 8080 when an external agent or MCP drives the desktop.
 
+## Messaging gateway
+
+Hermes' messaging gateway (Telegram, Discord, …) runs as the static s6 service `sandbar-gateway`, supervised by root and dropped to `abc` with `s6-setuidgid`. Hermes' own dynamic slot registration assumes the official image's uid 10000 and a writable `/run/service`, so it cannot self-supervise on this lsio base. The service sets `HERMES_S6_SUPERVISED_CHILD=1`, runs `hermes gateway run --replace`, and restarts it after a crash or container boot.
+
+The gateway starts only when a messaging bot token (any `*_BOT_TOKEN`, e.g. `TELEGRAM_BOT_TOKEN`) is in the container environment or in `/config/.hermes/.env`; until then the service polls every 15 seconds, so a token added later starts it without a restart. `SANDBAR_GATEWAY=1` forces it on and `SANDBAR_GATEWAY=0` keeps it off. Shared browser seats and `SANDBAR_AGENT=none` never run it.
+
+Because the Hermes venv has no pip, the service also writes `sandbar-hermes-vendor.pth` into the venv's `site-packages` (only when its content differs), exposing the vendored packages in `/config/.hermes/telegram_vendor` and `/config/.hermes/vendor` even though the `hermes` wrapper unsets `PYTHONPATH`.
+
 ## Authentication
 
 `-e CUSTOM_USER=me -e PASSWORD=...` protects both the desktop and chat pane with HTTP basic authentication.

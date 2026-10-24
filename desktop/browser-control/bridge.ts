@@ -524,19 +524,25 @@ export class BrowserBridge {
     } finally { if (!attached) await this.closeConnection(browser); }
   }
 
-  private async initialNavigationPage(attached: Attachment): Promise<any> {
+  private async initialNavigationPage(attached: Attachment): Promise<{ page: any; created: boolean }> {
     const pages = attached.context.pages();
     const selected = this.selectedTabId ? this.pages.get(this.selectedTabId) : undefined;
-    if (selected && this.pageIsApproved(selected, attached)) return selected;
+    if (selected && this.pageIsApproved(selected, attached)) return { page: selected, created: false };
     const approved = pages.find((page: any) => this.pageIsApproved(page, attached));
-    if (approved) return approved;
+    if (approved) return { page: approved, created: false };
     const blank = pages.find((page: any) => this.pageIsPristineAboutBlank(page));
-    return blank ?? await attached.context.newPage();
+    return blank ? { page: blank, created: false } : { page: await attached.context.newPage(), created: true };
   }
   private async open(args: Record<string, unknown>, newTab: boolean): Promise<Record<string, unknown>> {
     only(args, newTab ? ["url"] : ["url", "tabId"]); const attached = this.requireObservation(); const url = this.assertUrl(args.url, attached.origins);
     // An explicit tab id is never allowed to fall back to a different page.
-    const page = newTab ? await attached.context.newPage() : args.tabId === undefined ? await this.initialNavigationPage(attached) : this.approvedPage(args.tabId);
+    // Playwright's BrowserContext.newPage() takes no timeout, so a hung acquisition is bounded only by the request deadline.
+    const { page, created } = newTab ? { page: await attached.context.newPage(), created: true } : args.tabId === undefined ? await this.initialNavigationPage(attached) : { page: this.approvedPage(args.tabId), created: false };
+    // A call abandoned at the request deadline can settle after detach; it must not re-register the page, and a page it created is orphaned.
+    if (this.attachment !== attached) {
+      if (created) void Promise.resolve(page.close?.({ runBeforeUnload: false })).catch(() => undefined);
+      fail("session-lost");
+    }
     this.pageId(page);
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: ACTION_WAIT_MS });
     // A call abandoned at the request deadline can settle after detach/re-attach; it must not repopulate cleared state.

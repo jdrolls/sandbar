@@ -700,6 +700,23 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     expect(await bridge.handle(request("tabs", "tabs", {}))).toMatchObject({ ok: true, result: { tabs: [{ selected: false }] } });
   });
 
+  test("a new tab whose newPage settles after detach is closed and not re-registered", async () => {
+    configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, 20); await attach(bridge);
+    const context = adapter.browser.context; let settle: () => void = () => {}; const created: FakePage[] = [];
+    context.newPage = () => new Promise<FakePage>((resolve) => { settle = () => { const page = new FakePage("about:blank"); created.push(page); context.allPages.push(page); resolve(page); }; });
+    expect(await bridge.handle(request("tab-open", "tab-open", { url: "https://example.test/new" }))).toMatchObject({ ok: false, code: "timeout" });
+    expect(await bridge.handle(request("detach", "detach", {}))).toMatchObject({ ok: true });
+    await attach(bridge);
+    settle(); await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(created).toHaveLength(1);
+    expect(created[0].closed).toBe(1);
+    expect(created[0].gotoUrls).toEqual([]);
+    const tabs = (await bridge.handle(request("tabs", "tabs", {}))).result as { tabs: Array<{ tabId: string; selected: boolean }> };
+    expect(tabs.tabs.every((tab) => !tab.selected)).toBe(true);
+    expect([...(bridge as any).pages.values()]).not.toContain(created[0]);
+    expect((bridge as any).selectedTabId).toBeUndefined();
+  });
+
   test("rejects malformed schemas and omits browser URLs from doctor", async () => {
     configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter);
     expect(await bridge.handle({ id: "bad id", operation: "doctor", args: {} })).toMatchObject({ ok: false, code: "invalid-request" });

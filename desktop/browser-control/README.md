@@ -24,6 +24,15 @@ Each input line is at most 1 MiB and has `{id,operation,args}`. Each output
 line is exactly `{id,ok:true,result}` or `{id,ok:false,code}`. The bridge does
 not persist tokens, DOM, URLs, screenshots, downloads, or diagnostics.
 
+The control daemon aborts a request after 30 s, so every browser wait finishes
+inside it. Playwright action waits (`goto`, `snapshot`, `click`, `type`,
+`select`, `wait`, `screenshot`, `upload`) are capped at 20 s, and `wait`
+`milliseconds` accepts at most 20000. Browser page operations also have a 25 s
+per-request deadline. A Playwright `TimeoutError` or an expired deadline returns
+`{id,ok:false,code:"timeout"}`; the request queue is released, so later
+requests (including `doctor` and `detach`) are still served on the same bridge.
+An abandoned call is left to settle on its own and its late result is dropped.
+
 Install the pinned dependency and build from this directory:
 
 ```bash

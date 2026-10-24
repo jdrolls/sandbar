@@ -22,7 +22,14 @@ const MAX_TEXT = 64 * 1024;
 const MAX_EVENTS = 200;
 const MAX_SELECTOR = 1024;
 const MAX_INPUT = 16 * 1024;
-const MAX_WAIT_MS = 30_000;
+// The control daemon aborts a request after 30 s. Every browser wait finishes
+// well inside that window so the bridge answers with a typed error first:
+// Playwright action waits at 20 s (daemon timeout minus a 10 s margin) and a
+// per-request deadline at 25 s for operations that carry no Playwright timeout.
+const DAEMON_REQUEST_TIMEOUT_MS = 30_000;
+const ACTION_WAIT_MS = DAEMON_REQUEST_TIMEOUT_MS - 10_000;
+const REQUEST_DEADLINE_MS = DAEMON_REQUEST_TIMEOUT_MS - 5_000;
+const DEADLINE_OPERATIONS: ReadonlySet<string> = new Set(["open", "tab-open", "tab-select", "snapshot", "click", "type", "select", "key", "scroll", "wait", "screenshot", "viewport", "upload"]);
 const MAX_DRAIN_MS = 5_000;
 const MAX_VIEWPORT = { width: 7680, height: 7680 };
 const MAX_NATIVE_WINDOWS = 4;
@@ -36,7 +43,7 @@ const opaqueId = (): string => createHash("sha256").update(randomBytes(32)).dige
 const stableHash = (value: string): string => createHash("sha256").update(value).digest("hex");
 const hash = (value: string): string => stableHash(value).slice(0, 24);
 
-export type ErrorCode = "provider-unavailable" | "needs-human-auth" | "human-control" | "busy" | "permission-denied" | "stale-owner" | "session-lost" | "unsupported-capability" | "verification-failed" | "invalid-request";
+export type ErrorCode = "provider-unavailable" | "needs-human-auth" | "human-control" | "busy" | "permission-denied" | "stale-owner" | "session-lost" | "unsupported-capability" | "verification-failed" | "invalid-request" | "timeout";
 export interface BridgeResponse { id: string; ok: boolean; result?: Record<string, unknown>; code?: ErrorCode }
 // This is intentionally an already-opaque identity. Adapters must never pass
 // a debugger URL or endpoint UUID through the bridge response surface.
@@ -77,6 +84,9 @@ function truncate(value: string, max = MAX_TEXT): string { return value.length >
 function opaque(value: unknown): string { const id = string(value, 128); if (!/^[A-Za-z0-9_-]+$/.test(id)) fail("invalid-request"); return id; }
 function safeError(error: unknown): ErrorCode {
   if (error instanceof BridgeFailure) return error.code;
+  // Playwright's TimeoutError (a locator that never resolves, a navigation that
+  // never commits) is a typed, retryable outcome rather than a dead provider.
+  if (error instanceof Error && error.name === "TimeoutError") return "timeout";
   const message = error instanceof Error ? error.message.toLowerCase() : "";
   if (message.includes("target page") || message.includes("closed") || message.includes("detached")) return "session-lost";
   return "provider-unavailable";
@@ -137,7 +147,7 @@ export class BrowserBridge {
   private dispatch: Promise<void> = Promise.resolve();
   private ending = false;
 
-  constructor(private readonly adapter: BridgeAdapter) {}
+  constructor(private readonly adapter: BridgeAdapter, private readonly requestDeadlineMs = REQUEST_DEADLINE_MS) {}
 
   handle(request: unknown): Promise<BridgeResponse> {
     if (this.ending) return Promise.resolve({ id: "invalid", ok: false, code: "session-lost" });
@@ -157,11 +167,24 @@ export class BrowserBridge {
       id = opaque(input.id);
       const operation = string(input.operation, 64);
       const args = record(input.args);
-      const result = await this.operation(operation, args);
+      const result = await this.withDeadline(operation, () => this.operation(operation, args));
       return { id, ok: true, result };
     } catch (error) {
       return { id, ok: false, code: safeError(error) };
     }
+  }
+
+  // Requests are serialized, so one wedged page call would stall every later
+  // request (including doctor and detach) behind it. Answer with a typed timeout
+  // before the daemon's own deadline and let the abandoned call settle alone.
+  private async withDeadline<T>(operation: string, work: () => Promise<T>): Promise<T> {
+    if (!DEADLINE_OPERATIONS.has(operation)) return work();
+    const running = work();
+    running.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([running, new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new BridgeFailure("timeout")), this.requestDeadlineMs); })]);
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   private async operation(operation: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -515,23 +538,23 @@ export class BrowserBridge {
     // An explicit tab id is never allowed to fall back to a different page.
     const page = newTab ? await attached.context.newPage() : args.tabId === undefined ? await this.initialNavigationPage(attached) : this.approvedPage(args.tabId);
     this.pageId(page);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: MAX_WAIT_MS }); const tabId = this.pageId(page); this.selectedTabId = tabId; return { tabId };
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: ACTION_WAIT_MS }); const tabId = this.pageId(page); this.selectedTabId = tabId; return { tabId };
   }
   private async tabs(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, []); const attached = this.requireObservation(); return { tabs: attached.context.pages().filter((page: any) => this.pageIsApproved(page, attached)).map((page: any) => ({ tabId: this.pageId(page), selected: this.pageId(page) === this.selectedTabId })) }; }
   private async tabSelect(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const page = this.approvedPage(args.tabId); await page.bringToFront(); const tabId = this.pageId(page); this.selectedTabId = tabId; return { tabId }; }
-  private async snapshot(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); const attached = this.requireObservation(); const page = this.approvedPage(args.tabId); const parts: string[] = []; for (const frame of page.frames()) { if (!attached.origins.has(this.frameOrigin(frame))) continue; try { parts.push(truncate(await frame.locator("body").innerText({ timeout: MAX_WAIT_MS }))); } catch { /* unready approved frames are omitted */ } } return { tabId: this.pageId(page), text: truncate(parts.join("\n")) }; }
+  private async snapshot(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); const attached = this.requireObservation(); const page = this.approvedPage(args.tabId); const parts: string[] = []; for (const frame of page.frames()) { if (!attached.origins.has(this.frameOrigin(frame))) continue; try { parts.push(truncate(await frame.locator("body").innerText({ timeout: ACTION_WAIT_MS }))); } catch { /* unready approved frames are omitted */ } } return { tabId: this.pageId(page), text: truncate(parts.join("\n")) }; }
   private frameOrigin(frame: any): string { try { return new URL(String(frame.url())).origin; } catch { return ""; } }
   private locator(args: Record<string, unknown>, valueKey: "text" | "value" | undefined = undefined): { page: any; selector: string; value?: string } { const allowed = valueKey ? ["tabId", "selector", valueKey] : ["tabId", "selector"]; only(args, allowed); const selector = string(args.selector, MAX_SELECTOR); const value = valueKey ? string(args[valueKey], MAX_INPUT) : undefined; return { page: this.approvedPage(args.tabId), selector, value }; }
-  private async click(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector } = this.locator(args); await page.locator(selector).click({ timeout: MAX_WAIT_MS }); return { tabId: this.pageId(page) }; }
-  private async type(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector, value } = this.locator(args, "text"); await page.locator(selector).pressSequentially(value!, { timeout: MAX_WAIT_MS }); return { tabId: this.pageId(page) }; }
-  private async select(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector, value } = this.locator(args, "value"); await page.locator(selector).selectOption(value!, { timeout: MAX_WAIT_MS }); return { tabId: this.pageId(page) }; }
+  private async click(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector } = this.locator(args); await page.locator(selector).click({ timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }
+  private async type(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector, value } = this.locator(args, "text"); await page.locator(selector).pressSequentially(value!, { timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }
+  private async select(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector, value } = this.locator(args, "value"); await page.locator(selector).selectOption(value!, { timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }
   private async key(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "key"]); this.requireInput(); const page = this.approvedPage(args.tabId); const key = string(args.key, 64); if (!/^[A-Za-z0-9_+\-]+$/.test(key)) fail("invalid-request"); await page.keyboard.press(key); return { tabId: this.pageId(page) }; }
   private async scroll(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "x", "y"]); this.requireInput(); const page = this.approvedPage(args.tabId); await page.mouse.wheel(number(args.x, -10_000, 10_000), number(args.y, -10_000, 10_000)); return { tabId: this.pageId(page) }; }
-  private async wait(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "selector", "milliseconds"]); if (args.selector !== undefined) this.requireObservation(); const page = this.approvedPage(args.tabId); if (args.selector !== undefined) await page.locator(string(args.selector, MAX_SELECTOR)).waitFor({ timeout: args.milliseconds === undefined ? MAX_WAIT_MS : number(args.milliseconds, 0, MAX_WAIT_MS) }); else await page.waitForTimeout(number(args.milliseconds, 0, MAX_WAIT_MS)); return { tabId: this.pageId(page) }; }
-  private async screenshot(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const page = this.approvedPage(args.tabId); const bytes = Buffer.from(await page.screenshot({ type: "png" })); const size = await page.viewportSize?.(); return { mimeType: "image/png", data: b64(bytes), tabId: this.pageId(page), width: number(size?.width ?? 1, 1, MAX_VIEWPORT.width), height: number(size?.height ?? 1, 1, MAX_VIEWPORT.height) }; }
+  private async wait(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "selector", "milliseconds"]); if (args.selector !== undefined) this.requireObservation(); const page = this.approvedPage(args.tabId); if (args.selector !== undefined) await page.locator(string(args.selector, MAX_SELECTOR)).waitFor({ timeout: args.milliseconds === undefined ? ACTION_WAIT_MS : number(args.milliseconds, 0, ACTION_WAIT_MS) }); else await page.waitForTimeout(number(args.milliseconds, 0, ACTION_WAIT_MS)); return { tabId: this.pageId(page) }; }
+  private async screenshot(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const page = this.approvedPage(args.tabId); const bytes = Buffer.from(await page.screenshot({ type: "png", timeout: ACTION_WAIT_MS })); const size = await page.viewportSize?.(); return { mimeType: "image/png", data: b64(bytes), tabId: this.pageId(page), width: number(size?.width ?? 1, 1, MAX_VIEWPORT.width), height: number(size?.height ?? 1, 1, MAX_VIEWPORT.height) }; }
   private async events(args: Record<string, unknown>, type: "console" | "network"): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const tabId = args.tabId === undefined ? undefined : this.pageId(this.approvedPage(args.tabId)); const source = type === "console" ? this.consoleEvents : this.networkEvents; return { events: source.filter((event) => tabId === undefined || event.tabId === tabId) }; }
   private async viewport(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "width", "height"]); this.requireInput(); const page = this.approvedPage(args.tabId); const width = number(args.width, 320, MAX_VIEWPORT.width); const height = number(args.height, 240, MAX_VIEWPORT.height); await page.setViewportSize({ width, height }); return { tabId: this.pageId(page), width, height }; }
-  private async upload(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "selector", "name", "mimeType", "data"]); this.requireInput(); const page = this.approvedPage(args.tabId); const selector = string(args.selector, MAX_SELECTOR); const name = string(args.name, 128); const mimeType = string(args.mimeType, 128); const data = string(args.data, Math.ceil(MAX_BINARY_BYTES * 4 / 3) + 4); if (!/^[A-Za-z0-9._-]+$/.test(name) || !/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(mimeType)) fail("invalid-request"); let bytes: Buffer; try { bytes = Buffer.from(data, "base64"); } catch { fail("invalid-request"); } if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data) || bytes.length > MAX_BINARY_BYTES) fail("invalid-request"); await page.locator(selector).setInputFiles({ name, mimeType, buffer: bytes }); return { tabId: this.pageId(page) }; }
+  private async upload(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "selector", "name", "mimeType", "data"]); this.requireInput(); const page = this.approvedPage(args.tabId); const selector = string(args.selector, MAX_SELECTOR); const name = string(args.name, 128); const mimeType = string(args.mimeType, 128); const data = string(args.data, Math.ceil(MAX_BINARY_BYTES * 4 / 3) + 4); if (!/^[A-Za-z0-9._-]+$/.test(name) || !/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(mimeType)) fail("invalid-request"); let bytes: Buffer; try { bytes = Buffer.from(data, "base64"); } catch { fail("invalid-request"); } if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data) || bytes.length > MAX_BINARY_BYTES) fail("invalid-request"); await page.locator(selector).setInputFiles({ name, mimeType, buffer: bytes }, { timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }
   private async downloadList(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     only(args, ["tabId"]); this.requireObservation();
     const tabId = args.tabId === undefined ? undefined : this.pageId(this.approvedPage(args.tabId));

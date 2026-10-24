@@ -203,10 +203,9 @@
       divider.addEventListener("pointerup", stopDragging);
       divider.addEventListener("pointercancel", stopDragging);
 
-      const remoteHttp = window.location.protocol === "http:" &&
-        window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1";
+      // Secure contexts (https, localhost, 127.0.0.1, [::1], *.localhost) can carry the desktop stream.
       const hint = document.getElementById("http-hint");
-      if (remoteHttp) hint.hidden = false;
+      if (!window.isSecureContext) hint.hidden = false;
       document.getElementById("dismiss-hint").addEventListener("click", () => { hint.hidden = true; });
     })();
   </script>

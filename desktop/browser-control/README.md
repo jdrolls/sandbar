@@ -31,7 +31,11 @@ inside it. Playwright action waits (`goto`, `snapshot`, `click`, `type`,
 per-request deadline. A Playwright `TimeoutError` or an expired deadline returns
 `{id,ok:false,code:"timeout"}`; the request queue is released, so later
 requests (including `doctor` and `detach`) are still served on the same bridge.
-An abandoned call is left to settle on its own and its late result is dropped.
+An abandoned call is left to settle on its own and its late result is dropped;
+a late `open` cannot repopulate state after `detach`. Input calls without a
+Playwright timeout option (`key`, `scroll`, `viewport`, `tab-select`) are only
+bounded by the request deadline, so a wedged one could still act late.
+`attach`'s CDP connect uses the same 20 s cap.
 
 Install the pinned dependency and build from this directory:
 

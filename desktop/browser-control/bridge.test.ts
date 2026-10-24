@@ -681,6 +681,25 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     expect(await bridge.handle(request("after-late", "tabs", {}))).toMatchObject({ ok: true });
   });
 
+  test("reports a TimeoutError as timeout even when its call log mentions a closed or detached element", async () => {
+    configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await attach(bridge);
+    const page = adapter.browser.context.page;
+    page.locator = () => ({ click: async () => { throw Object.assign(new Error("Timeout 20000ms exceeded.\n  - element was detached from the DOM, retrying; dialog closed"), { name: "TimeoutError" }); } });
+    const tabId = ((await bridge.handle(request("tabs", "tabs", {}))).result as { tabs: Array<{ tabId: string }> }).tabs[0].tabId;
+    expect(await bridge.handle(request("click", "click", { tabId, selector: "button" }))).toMatchObject({ ok: false, code: "timeout" });
+  });
+
+  test("an abandoned open that settles after detach does not repopulate bridge state", async () => {
+    configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, 20); await attach(bridge);
+    const page = adapter.browser.context.page; let release: () => void = () => {};
+    page.goto = () => new Promise<void>((resolve) => { release = resolve; });
+    expect(await bridge.handle(request("open", "open", { url: "https://example.test/slow" }))).toMatchObject({ ok: false, code: "timeout" });
+    expect(await bridge.handle(request("detach", "detach", {}))).toMatchObject({ ok: true });
+    await attach(bridge);
+    release(); await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(await bridge.handle(request("tabs", "tabs", {}))).toMatchObject({ ok: true, result: { tabs: [{ selected: false }] } });
+  });
+
   test("rejects malformed schemas and omits browser URLs from doctor", async () => {
     configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter);
     expect(await bridge.handle({ id: "bad id", operation: "doctor", args: {} })).toMatchObject({ ok: false, code: "invalid-request" });

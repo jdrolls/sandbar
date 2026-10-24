@@ -538,7 +538,10 @@ export class BrowserBridge {
     // An explicit tab id is never allowed to fall back to a different page.
     const page = newTab ? await attached.context.newPage() : args.tabId === undefined ? await this.initialNavigationPage(attached) : this.approvedPage(args.tabId);
     this.pageId(page);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: ACTION_WAIT_MS }); const tabId = this.pageId(page); this.selectedTabId = tabId; return { tabId };
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: ACTION_WAIT_MS });
+    // A call abandoned at the request deadline can settle after detach/re-attach; it must not repopulate cleared state.
+    if (this.attachment !== attached) fail("session-lost");
+    const tabId = this.pageId(page); this.selectedTabId = tabId; return { tabId };
   }
   private async tabs(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, []); const attached = this.requireObservation(); return { tabs: attached.context.pages().filter((page: any) => this.pageIsApproved(page, attached)).map((page: any) => ({ tabId: this.pageId(page), selected: this.pageId(page) === this.selectedTabId })) }; }
   private async tabSelect(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const page = this.approvedPage(args.tabId); await page.bringToFront(); const tabId = this.pageId(page); this.selectedTabId = tabId; return { tabId }; }
@@ -787,7 +790,7 @@ export class NodeAdapter implements BridgeAdapter {
     // and this bridge are independently owned processes; Playwright then
     // serves Download.createReadStream() over its protocol instead of trusting
     // a browser-side artifact path that must never cross this boundary.
-    return playwright.chromium.connectOverCDP("http://127.0.0.1:9222", { noDefaults: false, isLocal: false });
+    return playwright.chromium.connectOverCDP("http://127.0.0.1:9222", { noDefaults: false, isLocal: false, timeout: ACTION_WAIT_MS });
   }
   async browserIdentity(): Promise<BrowserAdapterIdentity> {
     const controller = new AbortController();

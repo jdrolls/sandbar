@@ -24,6 +24,8 @@ Open `http://<host>:7681` for standalone agent chat. On first run, Hermes walks 
 
 For a reverse proxy or Tailscale setup, compose different surfaces with Window query parameters, for example `?desktop=https://desktop.example&chat=https://chat.example`. Remote plain HTTP cannot carry the desktop stream; use HTTPS.
 
+Over an SSH tunnel, forward the Window port plus 3000 and 7681 (the Window embeds `localhost:3000` and `localhost:7681`); see the [root README](../README.md#quick-start) for the command. `http://localhost` through the tunnel is a secure context, so no HTTPS is needed.
+
 ## Chromium sandbox mode
 
 Chromium keeps Sandbar's historical `--no-sandbox` behavior unless a Platform-created seat explicitly requests `SANDBAR_BROWSER_SANDBOX=namespace`. Before creating any resource, Platform verifies that Docker reports an `x86_64`/`x64` engine and inspects the selected local image. Namespace mode requires the fixed image contract label `io.sandbar.chromium-sandbox=namespace-v1` and an `amd64` image architecture; it never pulls, upgrades, or falls back to a legacy image. Platform then supplies its pinned, narrowly extended Docker seccomp policy inline. Existing seats and direct legacy containers are unchanged and do not receive these lookups.

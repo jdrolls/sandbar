@@ -52,6 +52,14 @@ docker run -d --name sandbar \
 
 Add `-p 8080:8080` and open **`http://localhost:8080`** — the Sandbar Window: desktop and agent chat on one page. First run walks you through connecting a provider (Nous Portal OAuth, Anthropic, OpenAI, OpenRouter, local models…). **No key baked in, ever.** Passing `-e ANTHROPIC_API_KEY=...` (or any provider key) skips onboarding. See [`desktop/`](desktop/) for auth, adapters, and all the knobs.
 
+**Remote host over an SSH tunnel:** the Window embeds the desktop and chat from `localhost:3000` and `localhost:7681`, so forward all three ports, not just the Window's:
+
+```bash
+ssh -L 8091:localhost:8080 -L 3000:localhost:3000 -L 7681:localhost:7681 user@host
+```
+
+Then open `http://localhost:8091`. `localhost` is a secure context, so the desktop stream works over plain HTTP and the HTTPS hint stays hidden. Tunneling only `8091` leaves both panes showing "localhost refused to connect".
+
 **The full platform (provision many computers from a dashboard, REST API, MCP):**
 
 ```bash

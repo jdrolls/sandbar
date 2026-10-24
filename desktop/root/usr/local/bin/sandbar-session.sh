@@ -53,10 +53,8 @@ EOF
   fi
 fi
 
-# Keep this wrapper alive long enough to leave a useful shell if Hermes cannot start.
-if hermes; then
-  exit 0
+# Always leave a usable shell: a deliberate (clean) Hermes exit is the moment to do setup work.
+if ! hermes; then
+  echo "Hermes exited with an error. You can retry with: hermes"
 fi
-
-echo "Hermes exited with an error. You can retry with: hermes"
 exec bash

@@ -28,8 +28,8 @@ not persist tokens, DOM, URLs, screenshots, downloads, or diagnostics.
 `snapshot {tabId, format:"aria"}` returns `{tabId, format:"aria", text}` with the
 Playwright aria snapshot of each approved-origin frame (roles, accessible names,
 states), under the same 64 KiB cap. Field values are replaced with `[redacted]`
-for textbox, searchbox, combobox, and spinbutton lines (Playwright prints
-password values in clear), and link `/url:` lines are dropped, so the tree holds
+for textbox, searchbox, combobox, spinbutton, and slider lines, bare or
+YAML single-quoted (Playwright prints password values in clear), and link `/url:` lines are dropped, so the tree holds
 no more page data than the text snapshot. A `<select>`'s `[selected]` option
 stays, as it does on screen.
 

@@ -83,7 +83,10 @@ function only(args: Record<string, unknown>, keys: readonly string[]): void { if
 // Aria snapshots print a field's current value after its name ("- textbox \"Email\": a@b.test") and each
 // link's href as a "- /url:" child; text snapshots carry neither, so field values are replaced and
 // hrefs (which can hold tokens) are dropped (sandbar i12).
-const ARIA_VALUE_ROLES = /^(\s*- (?:textbox|searchbox|combobox|spinbutton)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]\n]*\])*):[ \t]*\S.*$/gm;
+const ARIA_VALUE_ROLE = "(?:textbox|searchbox|combobox|spinbutton|slider)";
+// A key is either bare (`textbox "Name" [state]`) or, when the name holds YAML-significant text such as
+// ": " or " #", single-quoted as a whole with '' escapes (`'textbox "Email: work"'`).
+const ARIA_VALUE_ROLES = new RegExp(`^(\\s*- (?:${ARIA_VALUE_ROLE}(?: "(?:[^"\\\\]|\\\\.)*")?(?: \\[[^\\]\\n]*\\])*|'${ARIA_VALUE_ROLE}(?:[^'\\n]|'')*')):[ \\t]*\\S.*$`, "gm");
 const ARIA_URL_PROPERTY = /^\s*- \/url:.*(?:\n|$)/gm;
 export function redactAriaValues(tree: string): string { return tree.replace(ARIA_URL_PROPERTY, "").replace(ARIA_VALUE_ROLES, (_line, head: string) => `${head}: [redacted]`); }
 function truncate(value: string, max = MAX_TEXT): string { return value.length > max ? value.slice(0, max) : value; }

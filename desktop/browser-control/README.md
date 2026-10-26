@@ -24,6 +24,15 @@ Each input line is at most 1 MiB and has `{id,operation,args}`. Each output
 line is exactly `{id,ok:true,result}` or `{id,ok:false,code}`. The bridge does
 not persist tokens, DOM, URLs, screenshots, downloads, or diagnostics.
 
+`snapshot {tabId}` (or `format:"text"`) returns approved-origin body text.
+`snapshot {tabId, format:"aria"}` returns `{tabId, format:"aria", text}` with the
+Playwright aria snapshot of each approved-origin frame (roles, accessible names,
+states), under the same 64 KiB cap. Field values are replaced with `[redacted]`
+for textbox, searchbox, combobox, and spinbutton lines (Playwright prints
+password values in clear), and link `/url:` lines are dropped, so the tree holds
+no more page data than the text snapshot. A `<select>`'s `[selected]` option
+stays, as it does on screen.
+
 The control daemon aborts a request after 30 s, so every browser wait finishes
 inside it. Playwright action waits (`goto`, `snapshot`, `click`, `type`,
 `select`, `wait`, `screenshot`, `upload`) are capped at 20 s, and `wait`

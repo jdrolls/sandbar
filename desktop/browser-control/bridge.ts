@@ -80,6 +80,12 @@ function string(value: unknown, max: number): string { if (typeof value !== "str
 function bool(value: unknown): boolean { if (typeof value !== "boolean") fail("invalid-request"); return value; }
 function number(value: unknown, min: number, max: number): number { if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) fail("invalid-request"); return value; }
 function only(args: Record<string, unknown>, keys: readonly string[]): void { if (Object.keys(args).some((key) => !keys.includes(key))) fail("invalid-request"); }
+// Aria snapshots print a field's current value after its name ("- textbox \"Email\": a@b.test") and each
+// link's href as a "- /url:" child; text snapshots carry neither, so field values are replaced and
+// hrefs (which can hold tokens) are dropped (sandbar i12).
+const ARIA_VALUE_ROLES = /^(\s*- (?:textbox|searchbox|combobox|spinbutton)(?: "(?:[^"\\]|\\.)*")?(?: \[[^\]\n]*\])*):[ \t]*\S.*$/gm;
+const ARIA_URL_PROPERTY = /^\s*- \/url:.*(?:\n|$)/gm;
+export function redactAriaValues(tree: string): string { return tree.replace(ARIA_URL_PROPERTY, "").replace(ARIA_VALUE_ROLES, (_line, head: string) => `${head}: [redacted]`); }
 function truncate(value: string, max = MAX_TEXT): string { return value.length > max ? value.slice(0, max) : value; }
 function opaque(value: unknown): string { const id = string(value, 128); if (!/^[A-Za-z0-9_-]+$/.test(id)) fail("invalid-request"); return id; }
 function safeError(error: unknown): ErrorCode {
@@ -551,7 +557,12 @@ export class BrowserBridge {
   }
   private async tabs(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, []); const attached = this.requireObservation(); return { tabs: attached.context.pages().filter((page: any) => this.pageIsApproved(page, attached)).map((page: any) => ({ tabId: this.pageId(page), selected: this.pageId(page) === this.selectedTabId })) }; }
   private async tabSelect(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const page = this.approvedPage(args.tabId); await page.bringToFront(); const tabId = this.pageId(page); this.selectedTabId = tabId; return { tabId }; }
-  private async snapshot(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); const attached = this.requireObservation(); const page = this.approvedPage(args.tabId); const parts: string[] = []; for (const frame of page.frames()) { if (!attached.origins.has(this.frameOrigin(frame))) continue; try { parts.push(truncate(await frame.locator("body").innerText({ timeout: ACTION_WAIT_MS }))); } catch { /* unready approved frames are omitted */ } } return { tabId: this.pageId(page), text: truncate(parts.join("\n")) }; }
+  private async snapshot(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    only(args, ["tabId", "format"]); if (args.format !== undefined && args.format !== "text" && args.format !== "aria") fail("invalid-request");
+    const aria = args.format === "aria"; const attached = this.requireObservation(); const page = this.approvedPage(args.tabId); const parts: string[] = [];
+    for (const frame of page.frames()) { if (!attached.origins.has(this.frameOrigin(frame))) continue; try { const body = frame.locator("body"); parts.push(truncate(aria ? redactAriaValues(String(await body.ariaSnapshot({ timeout: ACTION_WAIT_MS }))) : await body.innerText({ timeout: ACTION_WAIT_MS }))); } catch { /* unready approved frames are omitted */ } }
+    return aria ? { tabId: this.pageId(page), format: "aria", text: truncate(parts.join("\n")) } : { tabId: this.pageId(page), text: truncate(parts.join("\n")) };
+  }
   private frameOrigin(frame: any): string { try { return new URL(String(frame.url())).origin; } catch { return ""; } }
   private locator(args: Record<string, unknown>, valueKey: "text" | "value" | undefined = undefined): { page: any; selector: string; value?: string } { const allowed = valueKey ? ["tabId", "selector", valueKey] : ["tabId", "selector"]; only(args, allowed); const selector = string(args.selector, MAX_SELECTOR); const value = valueKey ? string(args[valueKey], MAX_INPUT) : undefined; return { page: this.approvedPage(args.tabId), selector, value }; }
   private async click(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector } = this.locator(args); await page.locator(selector).click({ timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }

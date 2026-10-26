@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import { BrowserBridge, NodeAdapter, type BridgeAdapter, type LaunchedMousepad } from "./bridge";
+import { BrowserBridge, NodeAdapter, redactAriaValues, type BridgeAdapter, type LaunchedMousepad } from "./bridge";
 
 class FakePage {
   events = new Map<string, Function[]>();
@@ -24,7 +24,8 @@ class FakePage {
   async goto(url: string): Promise<void> { this.gotoUrls.push(url); this.urlValue = url; }
   async bringToFront(): Promise<void> {}
   frames(): FakePage[] { return [this]; }
-  locator(_selector: string): any { return { innerText: async () => "semantic page text", click: async () => {}, pressSequentially: async () => {}, selectOption: async () => {}, waitFor: async () => {}, setInputFiles: async () => {} }; }
+  ariaTree = '- heading "Welcome" [level=1]\n- link "Pricing":\n  - /url: https://example.test/pricing?token=abc\n- button "Sign in"';
+  locator(_selector: string): any { return { innerText: async () => "semantic page text", ariaSnapshot: async () => this.ariaTree, click: async () => {}, pressSequentially: async () => {}, selectOption: async () => {}, waitFor: async () => {}, setInputFiles: async () => {} }; }
   async screenshot(): Promise<Buffer> { return Buffer.from("png"); }
   async setViewportSize(_size: unknown): Promise<void> {}
   async viewportSize(): Promise<{ width: number; height: number }> { return { width: 800, height: 600 }; }
@@ -227,6 +228,59 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     expect(opened).toMatchObject({ ok: true });
     const tabId = (opened.result as { tabId: string }).tabId;
     expect(await bridge.handle(request("snapshot", "snapshot", { tabId }))).toMatchObject({ ok: true, result: { text: "semantic page text" } });
+  });
+
+  test("snapshot format aria returns roles and names, redacts values and hrefs (i12)", async () => {
+    configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await attach(bridge);
+    const tabId = ((await bridge.handle(request("tabs", "tabs", {}))).result as { tabs: Array<{ tabId: string }> }).tabs[0].tabId;
+    expect(await bridge.handle(request("text", "snapshot", { tabId, format: "text" }))).toEqual({ id: "text", ok: true, result: { tabId, text: "semantic page text" } });
+    const aria = await bridge.handle(request("aria", "snapshot", { tabId, format: "aria" }));
+    expect(aria).toEqual({ id: "aria", ok: true, result: { tabId, format: "aria", text: '- heading "Welcome" [level=1]\n- link "Pricing":\n- button "Sign in"' } });
+    for (const format of ["html", "", "ARIA", 1, null]) expect(await bridge.handle(request("bad", "snapshot", { tabId, format }))).toMatchObject({ ok: false, code: "invalid-request" });
+    expect(await bridge.handle(request("extra", "snapshot", { tabId, format: "aria", depth: 2 }))).toMatchObject({ ok: false, code: "invalid-request" });
+  });
+
+  test("aria snapshot keeps the approved-origin frame filter and 64 KB cap (i12)", async () => {
+    configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await attach(bridge);
+    const page = adapter.browser.context.page; const foreign = new FakePage("https://private.test/frame"); foreign.ariaTree = '- button "private"';
+    page.frames = () => [page, foreign]; page.ariaTree = "- paragraph: " + "x".repeat(70 * 1024);
+    const tabId = ((await bridge.handle(request("tabs", "tabs", {}))).result as { tabs: Array<{ tabId: string }> }).tabs[0].tabId;
+    const text = ((await bridge.handle(request("aria", "snapshot", { tabId, format: "aria" }))).result as { text: string }).text;
+    expect(text.length).toBe(64 * 1024); expect(text).not.toContain("private");
+  });
+
+  test("redactAriaValues hides field values and hrefs, keeps roles and names (i12)", () => {
+    const tree = [
+      '- textbox "Email": jonathan@example.test',
+      '- textbox "Password" [disabled]: hunter2',
+      '- textbox: unnamed value',
+      '- textbox "Empty"',
+      '- searchbox "Search": my query',
+      '- combobox "Country": United States',
+      '- combobox "Pick":',
+      '  - option "A" [selected]',
+      '- spinbutton "Qty": 3',
+      '- textbox "Say \\"hi\\"": quoted',
+      '- link "Docs":',
+      '  - /url: /docs?session=secret',
+      '- paragraph: textbox "Email": not a field',
+      '- button "Submit"',
+    ].join("\n");
+    expect(redactAriaValues(tree)).toBe([
+      '- textbox "Email": [redacted]',
+      '- textbox "Password" [disabled]: [redacted]',
+      '- textbox: [redacted]',
+      '- textbox "Empty"',
+      '- searchbox "Search": [redacted]',
+      '- combobox "Country": [redacted]',
+      '- combobox "Pick":',
+      '  - option "A" [selected]',
+      '- spinbutton "Qty": [redacted]',
+      '- textbox "Say \\"hi\\"": [redacted]',
+      '- link "Docs":',
+      '- paragraph: textbox "Email": not a field',
+      '- button "Submit"',
+    ].join("\n"));
   });
 
   test("preserves preexisting out-of-scope tabs while fencing new unauthorized popups", async () => {

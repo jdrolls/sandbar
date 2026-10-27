@@ -842,6 +842,13 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
       expect(popup!.closed).toBeGreaterThan(0);
     });
 
+    test("fails a click that left the clicked page itself off the approved origins", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, 0); await qaAttach(bridge);
+      const tabId = await firstTabId(bridge); const page = adapter.browser.context.page;
+      page.onClick = async () => { page.urlValue = "about:blank"; };
+      expect(await bridge.handle(request("click", "click", { tabId, selector: "a" }))).toMatchObject({ ok: false, code: "permission-denied" });
+    });
+
     test("allows a click whose navigation or popup stays on approved origins, and ignores aborted subframe navigations", async () => {
       configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, 0); await qaAttach(bridge);
       const tabId = await firstTabId(bridge); const subframe = navigationRoute("https://ads.outside.test/frame", {});

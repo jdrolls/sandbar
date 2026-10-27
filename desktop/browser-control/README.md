@@ -27,8 +27,9 @@ page input is `click`, `scroll` and `viewport`: `type`, `select`, `key`,
 `upload` and every `desktop-*` operation return `permission-denied`, even with
 `allowInput: true`. A `qa-layout` click also fences its outcome. While the click
 runs, and for 500 ms after it resolves, the bridge records any top-level
-navigation the origin route aborts and any page the click opens. A page left on
-an unapproved origin is closed. If either happened, the click returns
+navigation the origin route aborts and any page the click opens. A new page left
+on an unapproved origin is closed. If either happened, or the clicked page itself
+ends off the approved origins, the click returns
 `permission-denied` instead of succeeding silently. A controller that sends
 `inputScope` to an older bridge gets `invalid-request` (unknown key), so it
 fails closed against a stale image.

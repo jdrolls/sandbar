@@ -603,13 +603,13 @@ export class BrowserBridge {
   private async click(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const attached = this.requireInput(); const { page, selector } = this.locator(args);
     const click = () => page.locator(selector).click({ timeout: ACTION_WAIT_MS });
-    if (attached.inputScope === "qa-layout") await this.clickFenced(attached, click); else await click();
+    if (attached.inputScope === "qa-layout") await this.clickFenced(attached, page, click); else await click();
     return { tabId: this.pageId(page) };
   }
   // The route and page boundary already block an off-origin navigation or
   // popup. Under qa-layout the click must also report that block, so a caller
   // never reads a silently suppressed result as a successful interaction.
-  private async clickFenced(attached: Attachment, click: () => Promise<unknown>): Promise<void> {
+  private async clickFenced(attached: Attachment, page: any, click: () => Promise<unknown>): Promise<void> {
     // A fresh fence per click: a click abandoned at the request deadline that
     // settles later can only clear its own fence, never a newer click's.
     const fence: ClickFence = { violated: false, pages: new Set() };
@@ -618,6 +618,8 @@ export class BrowserBridge {
       await click();
       await new Promise<void>((resolve) => setTimeout(resolve, this.clickSettleMs));
       if (this.attachment !== attached) fail("session-lost");
+      // A script-driven navigation (blob:, data:, about:blank) never reaches the route.
+      if (!this.pageIsApproved(page, attached)) fence.violated = true;
       for (const popup of fence.pages) {
         if (this.pageIsApproved(popup, attached)) continue;
         fence.violated = true;

@@ -25,7 +25,8 @@ class FakePage {
   async bringToFront(): Promise<void> {}
   frames(): FakePage[] { return [this]; }
   ariaTree = '- heading "Welcome" [level=1]\n- link "Pricing":\n  - /url: https://example.test/pricing?token=abc\n- button "Sign in"';
-  locator(_selector: string): any { return { innerText: async () => "semantic page text", ariaSnapshot: async () => this.ariaTree, click: async () => {}, pressSequentially: async () => {}, selectOption: async () => {}, waitFor: async () => {}, setInputFiles: async () => {} }; }
+  onClick: () => Promise<void> = async () => {};
+  locator(_selector: string): any { return { innerText: async () => "semantic page text", ariaSnapshot: async () => this.ariaTree, click: async () => this.onClick(), pressSequentially: async () => {}, selectOption: async () => {}, waitFor: async () => {}, setInputFiles: async () => {} }; }
   async screenshot(): Promise<Buffer> { return Buffer.from("png"); }
   async setViewportSize(_size: unknown): Promise<void> {}
   async viewportSize(): Promise<{ width: number; height: number }> { return { width: 800, height: 600 }; }
@@ -125,6 +126,10 @@ function xdotoolSearchMiss(): Error { return Object.assign(new Error("xdotool fo
 function badWindow(): Error { return new Error("X Error of failed request:  BadWindow (invalid Window parameter)"); }
 function attach(bridge: BrowserBridge, allowInput = true, allowObservation = true, allowMutations = false) { return bridge.handle(request("attach", "attach", { origins: ["https://example.test"], allowInput, allowMutations, allowObservation })); }
 async function launchMousepad(bridge: BrowserBridge): Promise<string> { const response = await bridge.handle(request("launch", "desktop-launch", { app: "mousepad" })); expect(response).toMatchObject({ ok: true }); return (response.result as { windowId: string }).windowId; }
+function qaAttach(bridge: BrowserBridge, inputScope: unknown = "qa-layout", allowMutations = false) { return bridge.handle(request("attach", "attach", { origins: ["https://example.test"], allowInput: true, allowMutations, allowObservation: true, inputScope })); }
+async function firstTabId(bridge: BrowserBridge): Promise<string> { return ((await bridge.handle(request("tabs", "tabs", {}))).result as { tabs: Array<{ tabId: string }> }).tabs[0].tabId; }
+// A route request as Playwright reports it for a navigation of `frameParent`'s child (null = top-level).
+function navigationRoute(url: string, frameParent: unknown = null) { const route = { request: () => ({ url: () => url, method: () => "GET", isNavigationRequest: () => true, frame: () => ({ parentFrame: () => frameParent }) }), abort: async () => { route.aborted = true; }, continue: async () => { route.continued = true; }, aborted: false, continued: false }; return route; }
 async function eventually<T>(work: () => T | undefined | Promise<T | undefined>): Promise<T> {
   const deadline = Date.now() + 1_000;
   while (Date.now() < deadline) {
@@ -788,5 +793,73 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     expect(doctor).toMatchObject({ ok: true, result: { pageCount: 1, attached: false, display: { width: 1024, height: 768 } } });
     expect(JSON.stringify(doctor)).not.toContain("http");
     expect(adapter.browser.closedConnections).toBe(1);
+  });
+
+  describe("qa-layout input scope", () => {
+    test("attach rejects an unknown scope and qa-layout with mutations; absent scope keeps full input", async () => {
+      configured();
+      expect(await qaAttach(new BrowserBridge(new FakeAdapter()), "anything")).toMatchObject({ ok: false, code: "invalid-request" });
+      expect(await qaAttach(new BrowserBridge(new FakeAdapter()), "qa-layout", true)).toMatchObject({ ok: false, code: "invalid-request" });
+      const bridge = new BrowserBridge(new FakeAdapter()); expect(await qaAttach(bridge, "full")).toMatchObject({ ok: true });
+      const full = new BrowserBridge(new FakeAdapter()); expect(await attach(full)).toMatchObject({ ok: true });
+      const tabId = await firstTabId(full);
+      expect(await full.handle(request("type", "type", { tabId, selector: "input", text: "x" }))).toMatchObject({ ok: true });
+      expect(await full.handle(request("key", "key", { tabId, key: "Enter" }))).toMatchObject({ ok: true });
+    });
+
+    test("denies type, select, key, upload and every desktop operation even with allowInput", async () => {
+      configured(); const bridge = new BrowserBridge(new FakeAdapter(), undefined, 0); expect(await qaAttach(bridge)).toMatchObject({ ok: true });
+      const tabId = await firstTabId(bridge);
+      const denied: Array<[string, Record<string, unknown>]> = [
+        ["type", { tabId, selector: "input", text: "x" }], ["select", { tabId, selector: "select", value: "v" }], ["key", { tabId, key: "Enter" }],
+        ["upload", { tabId, selector: "input", name: "x.txt", mimeType: "text/plain", data: "eA==" }],
+        ["desktop-screenshot", { windowId: "w" }], ["desktop-click", { x: 1, y: 1 }], ["desktop-type", { text: "x" }], ["desktop-key", { key: "Return" }],
+        ["desktop-scroll", { x: 0, y: 1 }], ["desktop-launch", { app: "mousepad" }], ["desktop-windows", {}], ["desktop-activate", { windowId: "w" }],
+      ];
+      for (const [operation, args] of denied) expect(await bridge.handle(request(operation, operation, args))).toMatchObject({ ok: false, code: "permission-denied" });
+      expect(await bridge.handle(request("click", "click", { tabId, selector: "#tile" }))).toMatchObject({ ok: true, result: { tabId } });
+      expect(await bridge.handle(request("scroll", "scroll", { tabId, x: 0, y: 400 }))).toMatchObject({ ok: true });
+      expect(await bridge.handle(request("viewport", "viewport", { tabId, width: 390, height: 844 }))).toMatchObject({ ok: true });
+    });
+
+    test("fails a click whose top-level navigation the origin route aborted", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, 0); await qaAttach(bridge);
+      const tabId = await firstTabId(bridge); const offOrigin = navigationRoute("https://outside.test/");
+      adapter.browser.context.page.onClick = async () => { await adapter.browser.context.routes[0].handler(offOrigin); };
+      expect(await bridge.handle(request("click", "click", { tabId, selector: "a" }))).toMatchObject({ ok: false, code: "permission-denied" });
+      expect(offOrigin.aborted).toBe(true);
+      // The fence is per click: a later click with no blocked navigation succeeds.
+      adapter.browser.context.page.onClick = async () => {};
+      expect(await bridge.handle(request("click-2", "click", { tabId, selector: "a" }))).toMatchObject({ ok: true });
+    });
+
+    test("fails a click that opened an off-origin popup and closes the popup", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, 0); await qaAttach(bridge);
+      const tabId = await firstTabId(bridge); let popup: FakePage | undefined;
+      // window.open("about:blank") then a script write keeps the popup off-origin without a routed request.
+      adapter.browser.context.page.onClick = async () => { popup = await adapter.browser.context.newPage(); };
+      expect(await bridge.handle(request("click", "click", { tabId, selector: "a" }))).toMatchObject({ ok: false, code: "permission-denied" });
+      expect(popup!.closed).toBeGreaterThan(0);
+    });
+
+    test("allows a click whose navigation or popup stays on approved origins, and ignores aborted subframe navigations", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, 0); await qaAttach(bridge);
+      const tabId = await firstTabId(bridge); const subframe = navigationRoute("https://ads.outside.test/frame", {});
+      adapter.browser.context.page.onClick = async () => {
+        await adapter.browser.context.routes[0].handler(subframe);
+        const sameOrigin = navigationRoute("https://example.test/next"); await adapter.browser.context.routes[0].handler(sameOrigin);
+        const popup = await adapter.browser.context.newPage(); popup.urlValue = "https://example.test/lightbox";
+      };
+      expect(await bridge.handle(request("click", "click", { tabId, selector: "#tile" }))).toMatchObject({ ok: true, result: { tabId } });
+      expect(subframe.aborted).toBe(true);
+    });
+
+    test("a full-scope click keeps today's behaviour when its navigation is aborted", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, 0); await attach(bridge);
+      const tabId = await firstTabId(bridge); const offOrigin = navigationRoute("https://outside.test/");
+      adapter.browser.context.page.onClick = async () => { await adapter.browser.context.routes[0].handler(offOrigin); };
+      expect(await bridge.handle(request("click", "click", { tabId, selector: "a" }))).toMatchObject({ ok: true });
+      expect(offOrigin.aborted).toBe(true);
+    });
   });
 });

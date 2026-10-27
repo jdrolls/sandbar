@@ -31,6 +31,12 @@ const ACTION_WAIT_MS = DAEMON_REQUEST_TIMEOUT_MS - 10_000;
 const REQUEST_DEADLINE_MS = DAEMON_REQUEST_TIMEOUT_MS - 5_000;
 const DEADLINE_OPERATIONS: ReadonlySet<string> = new Set(["open", "tab-open", "tab-select", "snapshot", "click", "type", "select", "key", "scroll", "wait", "screenshot", "viewport", "upload"]);
 const MAX_DRAIN_MS = 5_000;
+// A qa-layout click keeps its navigation fence armed this long after the click
+// resolves: an off-origin navigation or popup may start just after the event.
+const CLICK_SETTLE_MS = 500;
+// `qa-layout` narrows page input to a plain selector click, scroll and viewport.
+export type InputScope = "full" | "qa-layout";
+const QA_LAYOUT_DENIED: ReadonlySet<string> = new Set(["type", "select", "key", "upload", "desktop-screenshot", "desktop-click", "desktop-type", "desktop-key", "desktop-scroll", "desktop-launch", "desktop-windows", "desktop-activate"]);
 const MAX_VIEWPORT = { width: 7680, height: 7680 };
 const MAX_NATIVE_WINDOWS = 4;
 const MAX_NATIVE_TEXT = 4096;
@@ -122,6 +128,9 @@ interface Attachment {
   allowInput: boolean;
   allowMutations: boolean;
   allowObservation: boolean;
+  inputScope: InputScope;
+  // Holds the fence of the qa-layout click in progress, if any; see clickFenced().
+  clickFence: { current?: ClickFence };
   routeHandler: (route: any) => Promise<void>;
   webSocketHandler: (route: any) => Promise<void>;
   requestHandler?: (request: any) => void;
@@ -133,6 +142,8 @@ interface Attachment {
   preexistingPages: Set<any>;
   pageHandlers: Map<any, { consoleHandler?: (message: any) => void; downloadHandler?: (download: any) => void; frameHandler?: (frame: any) => void }>;
 }
+
+interface ClickFence { violated: boolean; pages: Set<any> }
 
 export class BrowserBridge {
   private attachment?: Attachment;
@@ -156,7 +167,7 @@ export class BrowserBridge {
   private dispatch: Promise<void> = Promise.resolve();
   private ending = false;
 
-  constructor(private readonly adapter: BridgeAdapter, private readonly requestDeadlineMs = REQUEST_DEADLINE_MS) {}
+  constructor(private readonly adapter: BridgeAdapter, private readonly requestDeadlineMs = REQUEST_DEADLINE_MS, private readonly clickSettleMs = CLICK_SETTLE_MS) {}
 
   handle(request: unknown): Promise<BridgeResponse> {
     if (this.ending) return Promise.resolve({ id: "invalid", ok: false, code: "session-lost" });
@@ -197,6 +208,8 @@ export class BrowserBridge {
   }
 
   private async operation(operation: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    // qa-layout is a scope, not a grant: allowInput cannot widen it.
+    if (this.attachment?.inputScope === "qa-layout" && QA_LAYOUT_DENIED.has(operation)) fail("permission-denied");
     switch (operation) {
       case "attach": return this.attach(args);
       case "detach": return this.detach(args);
@@ -304,11 +317,14 @@ export class BrowserBridge {
   }
 
   private async attach(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    only(args, ["origins", "allowInput", "allowMutations", "allowObservation"]);
+    only(args, ["origins", "allowInput", "allowMutations", "allowObservation", "inputScope"]);
     if (this.attachment) fail("busy");
     if (process.env.SANDBAR_SHARED_BROWSER !== "1" || process.env.SANDBAR_BROWSER_SANDBOX !== "namespace") fail("verification-failed");
     const origins = this.validateOrigins(args.origins);
     const allowInput = bool(args.allowInput); const allowMutations = bool(args.allowMutations); const allowObservation = bool(args.allowObservation);
+    const inputScope = this.inputScope(args.inputScope);
+    if (inputScope === "qa-layout" && allowMutations) fail("invalid-request");
+    const clickFence: { current?: ClickFence } = {};
     const display = await this.adapter.display();
     if (display.width < 1 || display.height < 1) fail("verification-failed");
     const browser = await this.adapter.connect();
@@ -337,7 +353,10 @@ export class BrowserBridge {
       const request = route.request();
       let url: URL;
       try { url = new URL(request.url()); } catch { await route.abort(); return; }
-      if (!origins.has(url.origin) || (!allowMutations && !["GET", "HEAD"].includes(String(request.method()).toUpperCase()))) { await route.abort(); return; }
+      if (!origins.has(url.origin) || (!allowMutations && !["GET", "HEAD"].includes(String(request.method()).toUpperCase()))) {
+        if (clickFence.current && this.isTopLevelNavigation(request)) clickFence.current.violated = true;
+        await route.abort(); return;
+      }
       await route.continue();
     };
     // WebSocketRoute has close(), not Route.abort(). Closing before a server
@@ -354,7 +373,7 @@ export class BrowserBridge {
       await this.closeConnection(browser).catch(() => undefined);
       fail("provider-unavailable");
     }
-    const attachment: Attachment = { browser, context, origins, allowInput, allowMutations, allowObservation, routeHandler, webSocketHandler, preexistingPages: new Set(context.pages()), pageHandlers: new Map() };
+    const attachment: Attachment = { browser, context, origins, allowInput, allowMutations, allowObservation, inputScope, clickFence, routeHandler, webSocketHandler, preexistingPages: new Set(context.pages()), pageHandlers: new Map() };
     this.attachment = attachment;
     this.clearBuffers();
     for (const page of context.pages()) this.pageId(page);
@@ -362,6 +381,16 @@ export class BrowserBridge {
     return { attached: true, pageCount: context.pages().filter((page: any) => this.pageIsApproved(page, attachment)).length };
   }
 
+  private inputScope(value: unknown): InputScope {
+    if (value === undefined || value === "full") return "full";
+    if (value === "qa-layout") return "qa-layout";
+    fail("invalid-request");
+  }
+  private isTopLevelNavigation(request: any): boolean {
+    // Fail toward a violation: a navigation whose frame cannot be inspected is
+    // treated as top-level.
+    try { return Boolean(request.isNavigationRequest?.()) && !request.frame?.()?.parentFrame?.(); } catch { return true; }
+  }
   private installObservers(attached: Attachment): void {
     attached.requestHandler = (request: any): void => {
       if (this.attachment !== attached || !attached.allowObservation || !attached.origins.has(this.requestOrigin(request))) return;
@@ -390,7 +419,10 @@ export class BrowserBridge {
       this.clearBuffers();
       void this.closeConnection(attached.browser).catch(() => undefined);
     };
-    attached.pageHandler = (page: any): void => this.installPageBoundary(attached, page, !attached.preexistingPages.has(page));
+    attached.pageHandler = (page: any): void => {
+      attached.clickFence.current?.pages.add(page);
+      this.installPageBoundary(attached, page, !attached.preexistingPages.has(page));
+    };
     attached.context.on("serviceworker", attached.serviceWorkerHandler);
     attached.context.on("page", attached.pageHandler);
     attached.context.on("request", attached.requestHandler);
@@ -568,7 +600,32 @@ export class BrowserBridge {
   }
   private frameOrigin(frame: any): string { try { return new URL(String(frame.url())).origin; } catch { return ""; } }
   private locator(args: Record<string, unknown>, valueKey: "text" | "value" | undefined = undefined): { page: any; selector: string; value?: string } { const allowed = valueKey ? ["tabId", "selector", valueKey] : ["tabId", "selector"]; only(args, allowed); const selector = string(args.selector, MAX_SELECTOR); const value = valueKey ? string(args[valueKey], MAX_INPUT) : undefined; return { page: this.approvedPage(args.tabId), selector, value }; }
-  private async click(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector } = this.locator(args); await page.locator(selector).click({ timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }
+  private async click(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const attached = this.requireInput(); const { page, selector } = this.locator(args);
+    const click = () => page.locator(selector).click({ timeout: ACTION_WAIT_MS });
+    if (attached.inputScope === "qa-layout") await this.clickFenced(attached, click); else await click();
+    return { tabId: this.pageId(page) };
+  }
+  // The route and page boundary already block an off-origin navigation or
+  // popup. Under qa-layout the click must also report that block, so a caller
+  // never reads a silently suppressed result as a successful interaction.
+  private async clickFenced(attached: Attachment, click: () => Promise<unknown>): Promise<void> {
+    // A fresh fence per click: a click abandoned at the request deadline that
+    // settles later can only clear its own fence, never a newer click's.
+    const fence: ClickFence = { violated: false, pages: new Set() };
+    attached.clickFence.current = fence;
+    try {
+      await click();
+      await new Promise<void>((resolve) => setTimeout(resolve, this.clickSettleMs));
+      if (this.attachment !== attached) fail("session-lost");
+      for (const popup of fence.pages) {
+        if (this.pageIsApproved(popup, attached)) continue;
+        fence.violated = true;
+        void Promise.resolve(popup.close?.({ runBeforeUnload: false })).catch(() => undefined);
+      }
+      if (fence.violated) fail("permission-denied");
+    } finally { if (attached.clickFence.current === fence) attached.clickFence.current = undefined; }
+  }
   private async type(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector, value } = this.locator(args, "text"); await page.locator(selector).pressSequentially(value!, { timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }
   private async select(args: Record<string, unknown>): Promise<Record<string, unknown>> { this.requireInput(); const { page, selector, value } = this.locator(args, "value"); await page.locator(selector).selectOption(value!, { timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }
   private async key(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "key"]); this.requireInput(); const page = this.approvedPage(args.tabId); const key = string(args.key, 64); if (!/^[A-Za-z0-9_+\-]+$/.test(key)) fail("invalid-request"); await page.keyboard.press(key); return { tabId: this.pageId(page) }; }

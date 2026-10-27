@@ -20,6 +20,20 @@ client disconnect is its supported WebSocket-route cleanup lifecycle. Attach
 rejects a context that already has service workers, and immediately disconnects
 if one appears, because service-worker requests can bypass route interception.
 
+`attach` also accepts an optional `inputScope`, `"full"` (the default when
+absent) or `"qa-layout"`. Any other value, or `"qa-layout"` with
+`allowMutations: true`, returns `invalid-request`. Under `qa-layout` the only
+page input is `click`, `scroll` and `viewport`: `type`, `select`, `key`,
+`upload` and every `desktop-*` operation return `permission-denied`, even with
+`allowInput: true`. A `qa-layout` click also fences its outcome. While the click
+runs, and for 500 ms after it resolves, the bridge records any top-level
+navigation the origin route aborts and any page the click opens. A new page left
+on an unapproved origin is closed. If either happened, or the clicked page itself
+ends off the approved origins, the click returns
+`permission-denied` instead of succeeding silently. A controller that sends
+`inputScope` to an older bridge gets `invalid-request` (unknown key), so it
+fails closed against a stale image.
+
 Each input line is at most 1 MiB and has `{id,operation,args}`. Each output
 line is exactly `{id,ok:true,result}` or `{id,ok:false,code}`. The bridge does
 not persist tokens, DOM, URLs, screenshots, downloads, or diagnostics.

@@ -29,14 +29,18 @@ const MAX_INPUT = 16 * 1024;
 const DAEMON_REQUEST_TIMEOUT_MS = 30_000;
 const ACTION_WAIT_MS = DAEMON_REQUEST_TIMEOUT_MS - 10_000;
 const REQUEST_DEADLINE_MS = DAEMON_REQUEST_TIMEOUT_MS - 5_000;
-const DEADLINE_OPERATIONS: ReadonlySet<string> = new Set(["open", "tab-open", "tab-select", "snapshot", "click", "type", "select", "key", "scroll", "wait", "screenshot", "viewport", "upload"]);
+const DEADLINE_OPERATIONS: ReadonlySet<string> = new Set(["open", "tab-open", "tab-select", "snapshot", "click", "type", "select", "key", "scroll", "wait", "screenshot", "layout", "viewport", "upload"]);
 const MAX_DRAIN_MS = 5_000;
 // A qa-layout click keeps its navigation fence armed this long after the click
 // resolves: an off-origin navigation or popup may start just after the event.
 const CLICK_SETTLE_MS = 500;
 // `qa-layout` narrows page input to a plain selector click, scroll and viewport.
 export type InputScope = "full" | "qa-layout";
+// Off-lease requests a qa-layout attach may let through to a listed subresource
+// origin: plain GET loads of these Playwright resource types, never navigation.
+const SUBRESOURCE_TYPES: ReadonlySet<string> = new Set(["stylesheet", "font", "image"]);
 const QA_LAYOUT_DENIED: ReadonlySet<string> = new Set(["type", "select", "key", "upload", "desktop-screenshot", "desktop-click", "desktop-type", "desktop-key", "desktop-scroll", "desktop-launch", "desktop-windows", "desktop-activate"]);
+const LAYOUT_KEYS = ["scrollWidth", "scrollHeight", "clientWidth", "clientHeight", "innerWidth", "innerHeight"] as const;
 const MAX_VIEWPORT = { width: 7680, height: 7680 };
 const MAX_NATIVE_WINDOWS = 4;
 const MAX_NATIVE_TEXT = 4096;
@@ -125,6 +129,8 @@ interface Attachment {
   browser: any;
   context: any;
   origins: Set<string>;
+  // qa-layout only: off-lease origins that may serve GET stylesheet/font/image loads.
+  subresourceOrigins: Set<string>;
   allowInput: boolean;
   allowMutations: boolean;
   allowObservation: boolean;
@@ -226,6 +232,7 @@ export class BrowserBridge {
       case "scroll": return this.scroll(args);
       case "wait": return this.wait(args);
       case "screenshot": return this.screenshot(args);
+      case "layout": return this.layout(args);
       case "console": return this.events(args, "console");
       case "network": return this.events(args, "network");
       case "viewport": return this.viewport(args);
@@ -317,13 +324,17 @@ export class BrowserBridge {
   }
 
   private async attach(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    only(args, ["origins", "allowInput", "allowMutations", "allowObservation", "inputScope"]);
+    only(args, ["origins", "allowInput", "allowMutations", "allowObservation", "inputScope", "subresourceOrigins"]);
     if (this.attachment) fail("busy");
     if (process.env.SANDBAR_SHARED_BROWSER !== "1" || process.env.SANDBAR_BROWSER_SANDBOX !== "namespace") fail("verification-failed");
     const origins = this.validateOrigins(args.origins);
     const allowInput = bool(args.allowInput); const allowMutations = bool(args.allowMutations); const allowObservation = bool(args.allowObservation);
     const inputScope = this.inputScope(args.inputScope);
     if (inputScope === "qa-layout" && allowMutations) fail("invalid-request");
+    // Subresource origins widen only what a qa-layout page may load, so they
+    // are meaningless (and refused) for any other scope.
+    if (args.subresourceOrigins !== undefined && inputScope !== "qa-layout") fail("invalid-request");
+    const subresourceOrigins = args.subresourceOrigins === undefined ? new Set<string>() : this.validateOrigins(args.subresourceOrigins);
     const clickFence: { current?: ClickFence } = {};
     const display = await this.adapter.display();
     if (display.width < 1 || display.height < 1) fail("verification-failed");
@@ -353,7 +364,8 @@ export class BrowserBridge {
       const request = route.request();
       let url: URL;
       try { url = new URL(request.url()); } catch { await route.abort(); return; }
-      if (!origins.has(url.origin) || (!allowMutations && !["GET", "HEAD"].includes(String(request.method()).toUpperCase()))) {
+      const allowed = origins.has(url.origin) ? allowMutations || ["GET", "HEAD"].includes(String(request.method()).toUpperCase()) : this.isListedSubresource(request, url, subresourceOrigins);
+      if (!allowed) {
         if (clickFence.current && this.isTopLevelNavigation(request)) clickFence.current.violated = true;
         await route.abort(); return;
       }
@@ -373,7 +385,7 @@ export class BrowserBridge {
       await this.closeConnection(browser).catch(() => undefined);
       fail("provider-unavailable");
     }
-    const attachment: Attachment = { browser, context, origins, allowInput, allowMutations, allowObservation, inputScope, clickFence, routeHandler, webSocketHandler, preexistingPages: new Set(context.pages()), pageHandlers: new Map() };
+    const attachment: Attachment = { browser, context, origins, subresourceOrigins, allowInput, allowMutations, allowObservation, inputScope, clickFence, routeHandler, webSocketHandler, preexistingPages: new Set(context.pages()), pageHandlers: new Map() };
     this.attachment = attachment;
     this.clearBuffers();
     for (const page of context.pages()) this.pageId(page);
@@ -385,6 +397,11 @@ export class BrowserBridge {
     if (value === undefined || value === "full") return "full";
     if (value === "qa-layout") return "qa-layout";
     fail("invalid-request");
+  }
+  // Fail closed: any request detail that cannot be read keeps the abort.
+  private isListedSubresource(request: any, url: URL, subresourceOrigins: Set<string>): boolean {
+    if (!subresourceOrigins.has(url.origin)) return false;
+    try { return String(request.method()).toUpperCase() === "GET" && SUBRESOURCE_TYPES.has(String(request.resourceType())) && request.isNavigationRequest() === false; } catch { return false; }
   }
   private isTopLevelNavigation(request: any): boolean {
     // Fail toward a violation: a navigation whose frame cannot be inspected is
@@ -634,6 +651,22 @@ export class BrowserBridge {
   private async scroll(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "x", "y"]); this.requireInput(); const page = this.approvedPage(args.tabId); await page.mouse.wheel(number(args.x, -10_000, 10_000), number(args.y, -10_000, 10_000)); return { tabId: this.pageId(page) }; }
   private async wait(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "selector", "milliseconds"]); if (args.selector !== undefined) this.requireObservation(); const page = this.approvedPage(args.tabId); if (args.selector !== undefined) await page.locator(string(args.selector, MAX_SELECTOR)).waitFor({ timeout: args.milliseconds === undefined ? ACTION_WAIT_MS : number(args.milliseconds, 0, ACTION_WAIT_MS) }); else await page.waitForTimeout(number(args.milliseconds, 0, ACTION_WAIT_MS)); return { tabId: this.pageId(page) }; }
   private async screenshot(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const page = this.approvedPage(args.tabId); const bytes = Buffer.from(await page.screenshot({ type: "png", timeout: ACTION_WAIT_MS })); const size = await page.viewportSize?.(); return { mimeType: "image/png", data: b64(bytes), tabId: this.pageId(page), width: number(size?.width ?? 1, 1, MAX_VIEWPORT.width), height: number(size?.height ?? 1, 1, MAX_VIEWPORT.height) }; }
+  // A fixed read of document geometry; the caller supplies no selector or script.
+  private async layout(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    only(args, ["tabId"]); this.requireObservation(); const page = this.approvedPage(args.tabId);
+    const metrics: unknown = await page.evaluate(() => {
+      const scope = globalThis as any; const root = scope.document.documentElement;
+      return { scrollWidth: root.scrollWidth, scrollHeight: root.scrollHeight, clientWidth: root.clientWidth, clientHeight: root.clientHeight, innerWidth: scope.innerWidth, innerHeight: scope.innerHeight };
+    });
+    const values = metrics && typeof metrics === "object" ? metrics as Record<string, unknown> : {};
+    const result: Record<string, unknown> = {};
+    for (const key of LAYOUT_KEYS) {
+      const value = values[key];
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) fail("verification-failed");
+      result[key] = value;
+    }
+    return result;
+  }
   private async events(args: Record<string, unknown>, type: "console" | "network"): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const tabId = args.tabId === undefined ? undefined : this.pageId(this.approvedPage(args.tabId)); const source = type === "console" ? this.consoleEvents : this.networkEvents; return { events: source.filter((event) => tabId === undefined || event.tabId === tabId) }; }
   private async viewport(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "width", "height"]); this.requireInput(); const page = this.approvedPage(args.tabId); const width = number(args.width, 320, MAX_VIEWPORT.width); const height = number(args.height, 240, MAX_VIEWPORT.height); await page.setViewportSize({ width, height }); return { tabId: this.pageId(page), width, height }; }
   private async upload(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "selector", "name", "mimeType", "data"]); this.requireInput(); const page = this.approvedPage(args.tabId); const selector = string(args.selector, MAX_SELECTOR); const name = string(args.name, 128); const mimeType = string(args.mimeType, 128); const data = string(args.data, Math.ceil(MAX_BINARY_BYTES * 4 / 3) + 4); if (!/^[A-Za-z0-9._-]+$/.test(name) || !/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(mimeType)) fail("invalid-request"); let bytes: Buffer; try { bytes = Buffer.from(data, "base64"); } catch { fail("invalid-request"); } if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data) || bytes.length > MAX_BINARY_BYTES) fail("invalid-request"); await page.locator(selector).setInputFiles({ name, mimeType, buffer: bytes }, { timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }

@@ -31,6 +31,9 @@ class FakePage {
   async setViewportSize(_size: unknown): Promise<void> {}
   async viewportSize(): Promise<{ width: number; height: number }> { return { width: 800, height: 600 }; }
   async waitForTimeout(_milliseconds: number): Promise<void> {}
+  layoutMetrics: unknown = { scrollWidth: 1440, scrollHeight: 5200, clientWidth: 1440, clientHeight: 900, innerWidth: 1440, innerHeight: 900 };
+  evaluated: Function[] = [];
+  async evaluate(fn: Function): Promise<unknown> { this.evaluated.push(fn); return this.layoutMetrics; }
 }
 class FakeWorker {
   constructor(private readonly urlValue: string) {}
@@ -130,6 +133,10 @@ function qaAttach(bridge: BrowserBridge, inputScope: unknown = "qa-layout", allo
 async function firstTabId(bridge: BrowserBridge): Promise<string> { return ((await bridge.handle(request("tabs", "tabs", {}))).result as { tabs: Array<{ tabId: string }> }).tabs[0].tabId; }
 // A route request as Playwright reports it for a navigation of `frameParent`'s child (null = top-level).
 function navigationRoute(url: string, frameParent: unknown = null) { const route = { request: () => ({ url: () => url, method: () => "GET", isNavigationRequest: () => true, frame: () => ({ parentFrame: () => frameParent }) }), abort: async () => { route.aborted = true; }, continue: async () => { route.continued = true; }, aborted: false, continued: false }; return route; }
+// A routed request with a Playwright resource type, as the origin route sees it.
+function resourceRoute(url: string, resourceType: string, method = "GET", navigation = false) { const route = { request: () => ({ url: () => url, method: () => method, resourceType: () => resourceType, isNavigationRequest: () => navigation, frame: () => ({ parentFrame: () => null }) }), abort: async () => { route.aborted = true; }, continue: async () => { route.continued = true; }, aborted: false, continued: false }; return route; }
+const FONT_ORIGINS = ["https://fonts.example.test", "https://static.example.test"];
+function subresourceAttach(bridge: BrowserBridge, subresourceOrigins: unknown = FONT_ORIGINS, inputScope: unknown = "qa-layout") { return bridge.handle(request("attach", "attach", { origins: ["https://example.test"], allowInput: true, allowMutations: false, allowObservation: true, ...(inputScope === "absent" ? {} : { inputScope }), subresourceOrigins })); }
 async function eventually<T>(work: () => T | undefined | Promise<T | undefined>): Promise<T> {
   const deadline = Date.now() + 1_000;
   while (Date.now() < deadline) {
@@ -867,6 +874,105 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
       adapter.browser.context.page.onClick = async () => { await adapter.browser.context.routes[0].handler(offOrigin); };
       expect(await bridge.handle(request("click", "click", { tabId, selector: "a" }))).toMatchObject({ ok: true });
       expect(offOrigin.aborted).toBe(true);
+    });
+  });
+  describe("layout metric", () => {
+    test("returns exactly the six document geometry integers from a fixed in-bridge read", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await attach(bridge, false, true);
+      const tabId = await firstTabId(bridge);
+      const response = await bridge.handle(request("layout", "layout", { tabId }));
+      expect(response).toEqual({ id: "layout", ok: true, result: { scrollWidth: 1440, scrollHeight: 5200, clientWidth: 1440, clientHeight: 900, innerWidth: 1440, innerHeight: 900 } });
+      // The selected tab is the default, as for screenshot.
+      await bridge.handle(request("select", "tab-select", { tabId }));
+      expect(await bridge.handle(request("layout-default", "layout", {}))).toMatchObject({ ok: true });
+      expect(adapter.browser.context.page.evaluated).toHaveLength(2);
+    });
+
+    test("requires observation and rejects any argument but tabId", async () => {
+      configured(); const blind = new BrowserBridge(new FakeAdapter()); await attach(blind, true, false);
+      expect(await blind.handle(request("layout", "layout", {}))).toMatchObject({ ok: false, code: "permission-denied" });
+      const bridge = new BrowserBridge(new FakeAdapter()); await attach(bridge);
+      const tabId = await firstTabId(bridge);
+      for (const args of [{ tabId, selector: "body" }, { tabId, script: "1" }, { expression: "document.title" }]) {
+        expect(await bridge.handle(request("layout", "layout", args))).toMatchObject({ ok: false, code: "invalid-request" });
+      }
+      expect(await new BrowserBridge(new FakeAdapter()).handle(request("layout", "layout", {}))).toMatchObject({ ok: false, code: "session-lost" });
+    });
+
+    test("is allowed under qa-layout", async () => {
+      configured(); const bridge = new BrowserBridge(new FakeAdapter()); expect(await qaAttach(bridge)).toMatchObject({ ok: true });
+      expect(await bridge.handle(request("layout", "layout", { tabId: await firstTabId(bridge) }))).toMatchObject({ ok: true, result: { scrollWidth: 1440 } });
+    });
+
+    test("fails verification on a missing, negative, fractional or non-numeric page value", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await attach(bridge);
+      const tabId = await firstTabId(bridge); const page = adapter.browser.context.page;
+      const good = { scrollWidth: 390, scrollHeight: 800, clientWidth: 390, clientHeight: 844, innerWidth: 390, innerHeight: 844 };
+      for (const bad of [null, "390", { ...good, innerHeight: undefined }, { ...good, scrollWidth: -1 }, { ...good, clientWidth: 389.5 }, { ...good, innerWidth: "390" }]) {
+        page.layoutMetrics = bad;
+        expect(await bridge.handle(request("layout", "layout", { tabId }))).toMatchObject({ ok: false, code: "verification-failed" });
+      }
+      // Extra page keys never reach the caller.
+      page.layoutMetrics = { ...good, title: "secret" };
+      expect(await bridge.handle(request("layout", "layout", { tabId }))).toEqual({ id: "layout", ok: true, result: good });
+    });
+  });
+
+  describe("qa-layout subresource origins", () => {
+    test("attach rejects subresourceOrigins outside qa-layout and when malformed", async () => {
+      configured();
+      expect(await subresourceAttach(new BrowserBridge(new FakeAdapter()), FONT_ORIGINS, "absent")).toMatchObject({ ok: false, code: "invalid-request" });
+      expect(await subresourceAttach(new BrowserBridge(new FakeAdapter()), FONT_ORIGINS, "full")).toMatchObject({ ok: false, code: "invalid-request" });
+      for (const bad of [[], "https://fonts.example.test", ["https://fonts.example.test/css"], ["ftp://fonts.example.test"], ["https://user:pw@fonts.example.test"], [42], Array.from({ length: 33 }, (_v, i) => `https://f${i}.example.test`)]) {
+        expect(await subresourceAttach(new BrowserBridge(new FakeAdapter()), bad)).toMatchObject({ ok: false, code: "invalid-request" });
+      }
+      expect(await subresourceAttach(new BrowserBridge(new FakeAdapter()))).toMatchObject({ ok: true });
+    });
+
+    test("continues a GET stylesheet, font or image to a listed origin", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await subresourceAttach(bridge);
+      const handler = adapter.browser.context.routes[0].handler;
+      for (const [url, type] of [["https://fonts.example.test/css2?family=Archivo", "stylesheet"], ["https://static.example.test/s/font.woff2", "font"], ["https://static.example.test/logo.png", "image"]]) {
+        const route = resourceRoute(url, type); await handler(route);
+        expect(route).toMatchObject({ continued: true, aborted: false });
+      }
+    });
+
+    test("still aborts navigation, non-GET, other resource types and unlisted origins", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await subresourceAttach(bridge);
+      const handler = adapter.browser.context.routes[0].handler;
+      const denied = [
+        resourceRoute("https://fonts.example.test/", "document", "GET", true),
+        resourceRoute("https://fonts.example.test/frame", "document", "GET", true),
+        resourceRoute("https://fonts.example.test/font.woff2", "font", "GET", true),
+        resourceRoute("https://fonts.example.test/font.woff2", "font", "POST"),
+        resourceRoute("https://fonts.example.test/font.woff2", "font", "HEAD"),
+        resourceRoute("https://fonts.example.test/app.js", "script"),
+        resourceRoute("https://fonts.example.test/api", "xhr"),
+        resourceRoute("https://fonts.example.test/api", "fetch"),
+        resourceRoute("https://fonts.example.test/beacon", "ping", "POST"),
+        resourceRoute("https://unlisted.example.test/font.woff2", "font"),
+        resourceRoute("http://fonts.example.test/font.woff2", "font"),
+      ];
+      for (const route of denied) { await handler(route); expect(route).toMatchObject({ aborted: true, continued: false }); }
+      // A request whose details cannot be read fails closed.
+      const opaque = { request: () => ({ url: () => "https://fonts.example.test/font.woff2", method: () => "GET", resourceType: () => { throw new Error("detached"); }, isNavigationRequest: () => false }), abort: async () => { opaque.aborted = true; }, continue: async () => { opaque.continued = true; }, aborted: false, continued: false };
+      await handler(opaque); expect(opaque).toMatchObject({ aborted: true, continued: false });
+    });
+
+    test("a qa-layout click whose top-level navigation targets a listed subresource origin still fails", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, 0); await subresourceAttach(bridge);
+      const tabId = await firstTabId(bridge); const offOrigin = navigationRoute("https://fonts.example.test/");
+      adapter.browser.context.page.onClick = async () => { await adapter.browser.context.routes[0].handler(offOrigin); };
+      expect(await bridge.handle(request("click", "click", { tabId, selector: "a" }))).toMatchObject({ ok: false, code: "permission-denied" });
+      expect(offOrigin.aborted).toBe(true);
+    });
+
+    test("absent subresourceOrigins keeps the off-origin abort for every resource type", async () => {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await qaAttach(bridge);
+      const handler = adapter.browser.context.routes[0].handler;
+      for (const type of ["stylesheet", "font", "image"]) { const route = resourceRoute("https://fonts.example.test/x", type); await handler(route); expect(route.aborted).toBe(true); }
+      const sameOrigin = resourceRoute("https://example.test/style.css", "stylesheet"); await handler(sameOrigin); expect(sameOrigin.continued).toBe(true);
     });
   });
 });

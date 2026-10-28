@@ -34,9 +34,32 @@ ends off the approved origins, the click returns
 `inputScope` to an older bridge gets `invalid-request` (unknown key), so it
 fails closed against a stale image.
 
+A `qa-layout` attach may also pass `subresourceOrigins`: 1 to 32 exact
+canonical HTTP(S) origins outside the lease, for example a webfont or image
+CDN. The origin route then continues a request to a listed origin only when it
+is a `GET`, its Playwright `resourceType()` is `stylesheet`, `font` or `image`,
+and it is not a navigation request in any frame. Every other request to a
+listed origin (navigation, popup, subframe, script, `xhr`, `fetch`, beacon,
+`HEAD` or any non-`GET`) is aborted as before, and a click whose top-level
+navigation targets a listed origin still returns `permission-denied`. Network
+and console diagnostics stay limited to the lease origins. `subresourceOrigins`
+with any other `inputScope`, or a malformed list, returns `invalid-request`; an
+older bridge rejects the unknown key, so a controller fails closed. Like any
+approved origin, a listed origin is trusted with its own redirects, so list only
+hosts you would let serve the page directly.
+
 Each input line is at most 1 MiB and has `{id,operation,args}`. Each output
 line is exactly `{id,ok:true,result}` or `{id,ok:false,code}`. The bridge does
 not persist tokens, DOM, URLs, screenshots, downloads, or diagnostics.
+
+`layout {tabId?}` needs `allowObservation` (it is allowed under `qa-layout`)
+and returns exactly `{scrollWidth, scrollHeight, clientWidth, clientHeight,
+innerWidth, innerHeight}` as non-negative integers. The values come from a fixed
+in-bridge read of `document.documentElement` and `window`; the caller supplies no
+selector or script, so this is not an evaluator. Any argument but `tabId` is
+`invalid-request`, and a missing or non-integer page value is
+`verification-failed`. It answers questions such as horizontal overflow
+(`scrollWidth - innerWidth`). An older bridge answers `invalid-request`.
 
 `snapshot {tabId}` (or `format:"text"`) returns approved-origin body text.
 `snapshot {tabId, format:"aria"}` returns `{tabId, format:"aria", text}` with the

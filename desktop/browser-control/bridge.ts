@@ -107,6 +107,10 @@ function safeError(error: unknown): ErrorCode {
   // never commits) is a typed, retryable outcome rather than a dead provider.
   if (error instanceof Error && error.name === "TimeoutError") return "timeout";
   const message = error instanceof Error ? error.message.toLowerCase() : "";
+  // A selector that matches several elements (strict mode) or does not parse is
+  // the caller's mistake, not a dead seat. Checked first because a strict-mode
+  // message lists the matched elements, whose markup may say "closed".
+  if (message.includes("strict mode violation") || message.includes("while parsing") || message.includes("unknown engine") || message.includes("is not a valid selector")) return "invalid-request";
   if (message.includes("target page") || message.includes("closed") || message.includes("detached")) return "session-lost";
   return "provider-unavailable";
 }

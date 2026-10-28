@@ -83,6 +83,11 @@ Playwright timeout option (`key`, `scroll`, `viewport`, `tab-select`) are only
 bounded by the request deadline, so a wedged one could still act late.
 `attach`'s CDP connect uses the same 20 s cap.
 
+A selector that matches several elements (Playwright strict mode) or does not
+parse returns `invalid-request`, not `provider-unavailable`; narrow it, e.g.
+`".gallery-item >> nth=0"`. `provider-unavailable` stays reserved for transport
+and browser failures.
+
 Install the pinned dependency and build from this directory:
 
 ```bash

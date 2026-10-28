@@ -741,6 +741,24 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     expect(await bridge.handle(request("click-ok", "click", { tabId, selector: "button" }))).toMatchObject({ ok: true });
   });
 
+  test("maps Playwright selector errors to invalid-request and keeps provider-unavailable for transport failures", async () => {
+    configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await attach(bridge);
+    const page = adapter.browser.context.page; const original = page.locator.bind(page);
+    const tabId = ((await bridge.handle(request("tabs", "tabs", {}))).result as { tabs: Array<{ tabId: string }> }).tabs[0].tabId;
+    for (const message of [
+      "locator.click: Error: strict mode violation: locator('.gallery-item') resolved to 3 elements:\n    1) <div class=\"gallery-item closed\">…</div>",
+      "locator.click: Unexpected token \"]\" while parsing css selector \"a]\". Did you mean to CSS.escape it?",
+      "locator.click: Unknown engine \"bogus\" while parsing selector bogus=x",
+    ]) {
+      page.locator = () => ({ click: async () => { throw new Error(message); } });
+      expect(await bridge.handle(request("click-bad", "click", { tabId, selector: ".gallery-item" }))).toEqual({ id: "click-bad", ok: false, code: "invalid-request" });
+    }
+    page.locator = () => ({ click: async () => { throw new Error("browserType.connectOverCDP: connect ECONNREFUSED 127.0.0.1:9222"); } });
+    expect(await bridge.handle(request("click-dead", "click", { tabId, selector: "button" }))).toEqual({ id: "click-dead", ok: false, code: "provider-unavailable" });
+    page.locator = original;
+    expect(await bridge.handle(request("click-ok", "click", { tabId, selector: ".gallery-item >> nth=0" }))).toMatchObject({ ok: true });
+  });
+
   test("a never-resolving page call times out before the cap and does not poison the next request", async () => {
     configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, 50); await attach(bridge);
     const page = adapter.browser.context.page; const original = page.locator.bind(page);

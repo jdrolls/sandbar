@@ -730,6 +730,16 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     expect(await bridge.handle(request("wait-ok", "wait", { tabId, milliseconds: 20_000 }))).toMatchObject({ ok: true });
   });
 
+  test("brings the approved page to front before a screenshot, so a tab behind another one still paints", async () => {
+    configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await attach(bridge);
+    const page = adapter.browser.context.page; const order: string[] = [];
+    page.bringToFront = async () => { order.push("front"); };
+    page.screenshot = async () => { order.push("shot"); return Buffer.from("png"); };
+    const tabId = ((await bridge.handle(request("tabs", "tabs", {}))).result as { tabs: Array<{ tabId: string }> }).tabs[0].tabId;
+    expect(await bridge.handle(request("shot", "screenshot", { tabId }))).toMatchObject({ ok: true, result: { tabId, mimeType: "image/png" } });
+    expect(order).toEqual(["front", "shot"]);
+  });
+
   test("maps a Playwright TimeoutError to a typed timeout and keeps serving requests", async () => {
     configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter); await attach(bridge);
     const page = adapter.browser.context.page; const original = page.locator.bind(page);

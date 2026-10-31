@@ -183,6 +183,8 @@ export const CREDENTIAL_POLICY: Readonly<Record<string, unknown>> = {
   AutofillAddressEnabled: false,
   AutofillCreditCardEnabled: false,
   AutofillSettings: [{ url_pattern: "*", blocked_types: ["all"] }],
+  // Session restore stores typed usernames and TOTP codes; a restarted seat must open a new tab page, never reopen a filled form.
+  RestoreOnStartup: 5,
 };
 const MAX_POLICY_FILES = 32;
 const MAX_POLICY_FILE_BYTES = 64 * 1024;

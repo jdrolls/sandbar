@@ -3,5 +3,6 @@
   "PasswordLeakDetectionEnabled": false,
   "AutofillAddressEnabled": false,
   "AutofillCreditCardEnabled": false,
-  "AutofillSettings": [{ "url_pattern": "*", "blocked_types": ["all"] }]
+  "AutofillSettings": [{ "url_pattern": "*", "blocked_types": ["all"] }],
+  "RestoreOnStartup": 5
 }

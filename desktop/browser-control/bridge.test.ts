@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import { BrowserBridge, NodeAdapter, redactAriaValues, type BridgeAdapter, type LaunchedMousepad } from "./bridge";
+import { BrowserBridge, NodeAdapter, redactAriaValues, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
 
 class FakePage {
   events = new Map<string, Function[]>();
@@ -991,6 +991,240 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
       const handler = adapter.browser.context.routes[0].handler;
       for (const type of ["stylesheet", "font", "image"]) { const route = resourceRoute("https://fonts.example.test/x", type); await handler(route); expect(route.aborted).toBe(true); }
       const sameOrigin = resourceRoute("https://example.test/style.css", "stylesheet"); await handler(sameOrigin); expect(sameOrigin.continued).toBe(true);
+    });
+  });
+
+  describe("credential broker operations", () => {
+    const CANARY = "CANARY-s3cr3t-7f1e9b";
+    const LEASE = ["https://example.test", "https://other.test"];
+    // An element as probeCredentialField sees it; defaults are a fillable password input.
+    interface FakeField { localName?: string; type?: string; topDocument?: boolean; connected?: boolean; disabled?: boolean; readOnly?: boolean; visible?: boolean }
+    interface FieldHooks { onEvaluate?: () => void; onVisible?: () => void; onFill?: () => void; count?: () => Promise<number>; fillError?: Error }
+    function fakeElement(field: FakeField): unknown {
+      const doc: Record<string, unknown> = {}; const view: Record<string, unknown> = { document: doc };
+      view.top = field.topDocument === false ? {} : view; doc.defaultView = view;
+      return { namespaceURI: "http://www.w3.org/1999/xhtml", localName: field.localName ?? "input", type: field.type ?? "password", isConnected: field.connected ?? true, readOnly: field.readOnly ?? false, ownerDocument: doc, matches: (query: string) => query === ":disabled" && (field.disabled ?? false), hasAttribute: () => false };
+    }
+    // Replaces the page's locator with one whose selector resolves to `matches[selector]`, and records every fill.
+    // Any element access on a selector without exactly one match is recorded in `fills.touched`.
+    function credentialFields(page: FakePage, matches: Record<string, FakeField[]>, hooks: FieldHooks = {}): Array<{ selector: string; value: string }> & { touched: number } {
+      const fills = Object.assign([] as Array<{ selector: string; value: string }>, { touched: 0 });
+      page.locator = (selector: string) => {
+        const elements = matches[selector] ?? [];
+        // As Playwright: several matches throw a strict-mode error; zero matches wait and time out.
+        const single = (): FakeField => {
+          if (elements.length === 1) return elements[0];
+          fills.touched++;
+          if (elements.length > 1) throw new Error(`strict mode violation: locator('${selector}') resolved to ${elements.length} elements`);
+          throw Object.assign(new Error("Timeout 20000ms exceeded."), { name: "TimeoutError" });
+        };
+        return {
+          count: hooks.count ?? (async () => elements.length),
+          evaluate: async (fn: Function) => { const element = fakeElement(single()); hooks.onEvaluate?.(); return fn(element); },
+          isVisible: async () => { const visible = single().visible ?? true; hooks.onVisible?.(); return visible; },
+          fill: async (value: string, options: { timeout?: number }) => { single(); expect(options.timeout).toBe(2_000); hooks.onFill?.(); if (hooks.fillError) throw hooks.fillError; fills.push({ selector, value }); },
+        };
+      };
+      return fills;
+    }
+    function leaseAttach(bridge: BrowserBridge, options: { allowInput?: boolean; allowObservation?: boolean; inputScope?: string } = {}) {
+      return bridge.handle(request("attach", "attach", { origins: LEASE, allowInput: options.allowInput ?? false, allowMutations: false, allowObservation: options.allowObservation ?? false, ...(options.inputScope ? { inputScope: options.inputScope } : {}) }));
+    }
+    // The broker's caller has no observation grant, so tab ids come from bridge state as the daemon tracks them.
+    function tabIdOf(bridge: BrowserBridge, page: FakePage): string { return (bridge as any).pageIds.get(page); }
+    function credential(tabId: string, overrides: Record<string, unknown> = {}) { return { tabId, field: "password", selector: "#password", value: CANARY, expectOrigin: "https://example.test", ...overrides }; }
+    async function leased(options: Parameters<typeof leaseAttach>[1] = {}, deadlineMs?: number) {
+      configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, deadlineMs);
+      expect(await leaseAttach(bridge, options)).toMatchObject({ ok: true });
+      const page = adapter.browser.context.page; return { adapter, bridge, page, tabId: tabIdOf(bridge, page) };
+    }
+
+    test("committed-origin returns exactly the approved main-frame origin with no observation or input grant", async () => {
+      const { bridge, page, tabId } = await leased();
+      expect(await bridge.handle(request("origin", "committed-origin", { tabId }))).toEqual({ id: "origin", ok: true, result: { origin: "https://example.test" } });
+      page.urlValue = "https://other.test/login?next=%2F";
+      expect(await bridge.handle(request("origin-other", "committed-origin", { tabId }))).toEqual({ id: "origin-other", ok: true, result: { origin: "https://other.test" } });
+    });
+
+    test("committed-origin refuses an origin outside the lease, a missing or extra argument, and no attachment", async () => {
+      const { bridge, page, tabId } = await leased();
+      page.urlValue = "https://private.test/";
+      expect(await bridge.handle(request("outside", "committed-origin", { tabId }))).toEqual({ id: "outside", ok: false, code: "permission-denied" });
+      page.urlValue = "about:blank";
+      expect(await bridge.handle(request("blank", "committed-origin", { tabId }))).toEqual({ id: "blank", ok: false, code: "permission-denied" });
+      page.urlValue = "https://example.test/";
+      for (const args of [{}, { tabId, frame: "main" }, { tabId: "not an id" }, { tabId: "a".repeat(64) }]) {
+        expect(await bridge.handle(request("bad", "committed-origin", args))).toMatchObject({ ok: false, code: "invalid-request" });
+      }
+      expect(await new BrowserBridge(new FakeAdapter()).handle(request("detached", "committed-origin", { tabId }))).toMatchObject({ ok: false, code: "session-lost" });
+    });
+
+    test("credential-type fills each field into a fitting input and returns exactly {}", async () => {
+      const { bridge, page, tabId } = await leased();
+      const cases: Array<[string, string]> = [["password", "password"], ["username", "text"], ["username", "email"], ["username", "tel"], ["totp", "text"], ["totp", "tel"], ["totp", "number"]];
+      for (const [field, type] of cases) {
+        const fills = credentialFields(page, { "#field": [{ type }] });
+        const response = await bridge.handle(request(`fill-${field}-${type}`, "credential-type", credential(tabId, { field, selector: "#field" })));
+        expect(response).toEqual({ id: `fill-${field}-${type}`, ok: true, result: {} });
+        expect(fills).toEqual([{ selector: "#field", value: CANARY }]);
+      }
+      // A missing, empty or unknown type attribute is normalized by the browser to "text".
+      const fills = credentialFields(page, { "input[name=user]": [{ type: "text" }] });
+      expect(await bridge.handle(request("default-type", "credential-type", credential(tabId, { field: "username", selector: "input[name=user]" })))).toEqual({ id: "default-type", ok: true, result: {} });
+      expect(fills).toHaveLength(1);
+    });
+
+    test("credential-type needs no allowInput or observation grant but still requires an attachment", async () => {
+      const { bridge, page, tabId } = await leased({ allowInput: false, allowObservation: false });
+      const fills = credentialFields(page, { "#password": [{}] });
+      expect(await bridge.handle(request("no-grants", "credential-type", credential(tabId)))).toEqual({ id: "no-grants", ok: true, result: {} });
+      expect(fills).toHaveLength(1);
+      expect(await bridge.handle(request("detach", "detach", {}))).toMatchObject({ ok: true });
+      expect(await bridge.handle(request("after-detach", "credential-type", credential(tabId)))).toEqual({ id: "after-detach", ok: false, code: "session-lost" });
+      expect(fills).toHaveLength(1);
+    });
+
+    test("refuses an expectOrigin that differs from the page or a page origin outside the lease", async () => {
+      const { bridge, page, tabId } = await leased();
+      const fills = credentialFields(page, { "#password": [{}] });
+      // Both origins are leased, but the broker expected the other one.
+      expect(await bridge.handle(request("mismatch", "credential-type", credential(tabId, { expectOrigin: "https://other.test" })))).toEqual({ id: "mismatch", ok: false, code: "permission-denied" });
+      page.urlValue = "https://private.test/login";
+      expect(await bridge.handle(request("outside", "credential-type", credential(tabId, { expectOrigin: "https://private.test" })))).toEqual({ id: "outside", ok: false, code: "permission-denied" });
+      expect(fills).toEqual([]);
+    });
+
+    test("refuses zero or several selector matches with nothing filled", async () => {
+      const { bridge, page, tabId } = await leased();
+      const fills = credentialFields(page, { "#password": [], ".password": [{}, {}] });
+      expect(await bridge.handle(request("zero", "credential-type", credential(tabId)))).toEqual({ id: "zero", ok: false, code: "invalid-request" });
+      expect(await bridge.handle(request("two", "credential-type", credential(tabId, { selector: ".password" })))).toEqual({ id: "two", ok: false, code: "invalid-request" });
+      expect(fills).toEqual([]);
+      // The count gate refuses before any element is probed or filled.
+      expect(fills.touched).toBe(0);
+    });
+
+    test("refuses an element whose kind or input type does not fit the field", async () => {
+      const { bridge, page, tabId } = await leased();
+      const denied: Array<[string, FakeField]> = [
+        ["password", { type: "text" }], ["password", { type: "email" }], ["username", { type: "password" }], ["username", { type: "search" }],
+        ["username", { type: "hidden" }], ["totp", { type: "password" }], ["totp", { type: "email" }], ["password", { localName: "textarea", type: "textarea" }],
+        ["password", { localName: "div", type: "" }],
+      ];
+      for (const [field, element] of denied) {
+        const fills = credentialFields(page, { "#field": [element] });
+        expect(await bridge.handle(request(`deny-${field}`, "credential-type", credential(tabId, { field, selector: "#field" })))).toEqual({ id: `deny-${field}`, ok: false, code: "permission-denied" });
+        expect(fills).toEqual([]);
+      }
+    });
+
+    test("refuses a hidden, disabled, readonly, disconnected or non-top-document input", async () => {
+      const { bridge, page, tabId } = await leased();
+      for (const element of [{ visible: false }, { disabled: true }, { readOnly: true }, { connected: false }, { topDocument: false }] as FakeField[]) {
+        const fills = credentialFields(page, { "#password": [element] });
+        expect(await bridge.handle(request("unfit", "credential-type", credential(tabId)))).toEqual({ id: "unfit", ok: false, code: "permission-denied" });
+        expect(fills).toEqual([]);
+      }
+    });
+
+    test("refuses selectors that chain parts or enter a frame before resolving them", async () => {
+      const { bridge, page, tabId } = await leased();
+      let resolved = 0; const original = credentialFields(page, {}); const locator = page.locator;
+      page.locator = (selector: string) => { resolved++; return locator(selector); };
+      for (const selector of ["iframe >> #password", "#a>>#b", "internal:control=enter-frame", "iframe >> internal:control=enter-frame >> input", "INTERNAL:attr=[name=p]", "control=enter-frame", "internal:has=\"#x\""]) {
+        expect(await bridge.handle(request("selector", "credential-type", credential(tabId, { selector })))).toEqual({ id: "selector", ok: false, code: "invalid-request" });
+      }
+      expect(resolved).toBe(0); expect(original).toEqual([]);
+    });
+
+    test("rejects malformed arguments as invalid-request", async () => {
+      const { bridge, page, tabId } = await leased();
+      const fills = credentialFields(page, { "#password": [{}] });
+      const { tabId: _omit, ...withoutTab } = credential(tabId);
+      const malformed: Record<string, unknown>[] = [
+        withoutTab, { ...credential(tabId), extra: true }, credential(tabId, { field: "pin" }), credential(tabId, { field: undefined }),
+        credential(tabId, { value: "" }), credential(tabId, { value: "x".repeat(1025) }), credential(tabId, { value: `${CANARY}\0` }), credential(tabId, { value: 1234 }),
+        credential(tabId, { selector: "" }), credential(tabId, { expectOrigin: "http://example.test" }), credential(tabId, { expectOrigin: "https://example.test/" }),
+        credential(tabId, { expectOrigin: "https://example.test/login" }), credential(tabId, { expectOrigin: "https://user:pw@example.test" }), credential(tabId, { expectOrigin: "https://example.test:443" }),
+        credential(tabId, { expectOrigin: "example.test" }), credential(tabId, { expectOrigin: undefined }),
+      ];
+      for (const args of malformed) expect(await bridge.handle(request("malformed", "credential-type", args))).toEqual({ id: "malformed", ok: false, code: "invalid-request" });
+      expect(fills).toEqual([]);
+      // 1024 characters is the inclusive limit.
+      expect(await bridge.handle(request("max", "credential-type", credential(tabId, { value: "x".repeat(1024) })))).toEqual({ id: "max", ok: true, result: {} });
+    });
+
+    test("both operations are denied under qa-layout", async () => {
+      const { bridge, page, tabId } = await leased({ allowInput: true, allowObservation: true, inputScope: "qa-layout" });
+      const fills = credentialFields(page, { "#password": [{}] });
+      expect(await bridge.handle(request("qa-origin", "committed-origin", { tabId }))).toEqual({ id: "qa-origin", ok: false, code: "permission-denied" });
+      expect(await bridge.handle(request("qa-type", "credential-type", credential(tabId)))).toEqual({ id: "qa-type", ok: false, code: "permission-denied" });
+      expect(fills).toEqual([]);
+    });
+
+    test("a navigation between the origin check and the fill is refused with nothing filled", async () => {
+      const { bridge, page, tabId } = await leased();
+      // A navigation to another leased origin after the element checks.
+      let fills = credentialFields(page, { "#password": [{}] }, { onVisible: () => { page.urlValue = "https://other.test/phish"; } });
+      expect(await bridge.handle(request("nav-origin", "credential-type", credential(tabId)))).toEqual({ id: "nav-origin", ok: false, code: "permission-denied" });
+      expect(fills).toEqual([]);
+      // A navigation away and back to the same origin is caught by the main-frame event.
+      page.urlValue = "https://example.test/";
+      fills = credentialFields(page, { "#password": [{}] }, { onEvaluate: () => page.emit("framenavigated", page) });
+      expect(await bridge.handle(request("nav-same", "credential-type", credential(tabId)))).toEqual({ id: "nav-same", ok: false, code: "permission-denied" });
+      expect(fills).toEqual([]);
+      // A subframe navigation does not void the main-frame check.
+      fills = credentialFields(page, { "#password": [{}] }, { onEvaluate: () => page.emit("framenavigated", new FakePage("https://ads.test/")) });
+      expect(await bridge.handle(request("nav-subframe", "credential-type", credential(tabId)))).toEqual({ id: "nav-subframe", ok: true, result: {} });
+      expect(fills).toHaveLength(1);
+      // The listener is removed once the request settles.
+      expect((page.events.get("framenavigated") ?? []).length).toBe(1);
+    });
+
+    test("a navigation during the fill reports verification-failed, never {}", async () => {
+      const { bridge, page, tabId } = await leased();
+      credentialFields(page, { "#password": [{}] }, { onFill: () => { page.urlValue = "https://other.test/"; page.emit("framenavigated", page); } });
+      expect(await bridge.handle(request("nav-during", "credential-type", credential(tabId)))).toEqual({ id: "nav-during", ok: false, code: "verification-failed" });
+    });
+
+    test("an abandoned request that settles after its deadline never fills", async () => {
+      let release: () => void = () => {}; const gate = new Promise<void>((resolve) => { release = resolve; });
+      const { bridge, page, tabId } = await leased({}, 50);
+      const fills = credentialFields(page, { "#password": [{}] }, { count: async () => { await gate; return 1; } });
+      expect(await bridge.handle(request("hung", "credential-type", credential(tabId)))).toEqual({ id: "hung", ok: false, code: "timeout" });
+      release(); await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(fills).toEqual([]);
+      expect(await bridge.handle(request("next", "committed-origin", { tabId }))).toMatchObject({ ok: true });
+    });
+
+    test("the canary value never appears in any response or console line, success or failure", async () => {
+      const { bridge, page, tabId } = await leased();
+      const responses: BridgeResponse[] = []; const logged: unknown[][] = [];
+      const spies = (["log", "info", "warn", "error", "debug"] as const).map((method) => spyOn(console, method).mockImplementation((...line: unknown[]) => { logged.push(line); }));
+      const send = async (args: Record<string, unknown>) => { responses.push(await bridge.handle(request("canary", "credential-type", args))); };
+      credentialFields(page, { "#password": [{}] });
+      await send(credential(tabId));
+      credentialFields(page, { "#password": [{ type: "text" }] });
+      await send(credential(tabId));
+      credentialFields(page, { "#password": [{}] }, { fillError: new Error(`locator.fill: Error: could not type "${CANARY}" into input`) });
+      await send(credential(tabId));
+      credentialFields(page, { "#password": [{}] }, { fillError: Object.assign(new Error(`Timeout 2000ms exceeded filling "${CANARY}"`), { name: "TimeoutError" }) });
+      await send(credential(tabId));
+      credentialFields(page, { "#password": [{}] }, { onFill: () => { page.urlValue = "https://other.test/"; } });
+      await send(credential(tabId));
+      await send(credential(tabId, { value: `${CANARY}\0` }));
+      await send(credential(tabId, { value: CANARY.repeat(60) }));
+      await send(credential(tabId, { expectOrigin: `https://${CANARY.toLowerCase()}.test` }));
+      await send(credential(tabId, { selector: `#${CANARY} >> input` }));
+      await send(credential(tabId, { field: CANARY }));
+      await send({ ...credential(tabId), [CANARY]: CANARY });
+      responses.push(await bridge.handle(request("origin", "committed-origin", { tabId })));
+      for (const spy of spies) spy.mockRestore();
+      expect(responses.filter((response) => response.ok)).toHaveLength(2);
+      expect(responses.filter((response) => !response.ok).length).toBe(10);
+      for (const response of responses) expect(JSON.stringify(response)).not.toContain(CANARY);
+      expect(JSON.stringify(responses).toLowerCase()).not.toContain(CANARY.toLowerCase());
+      expect(logged).toEqual([]);
     });
   });
 });

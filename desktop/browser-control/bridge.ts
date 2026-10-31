@@ -29,7 +29,7 @@ const MAX_INPUT = 16 * 1024;
 const DAEMON_REQUEST_TIMEOUT_MS = 30_000;
 const ACTION_WAIT_MS = DAEMON_REQUEST_TIMEOUT_MS - 10_000;
 const REQUEST_DEADLINE_MS = DAEMON_REQUEST_TIMEOUT_MS - 5_000;
-const DEADLINE_OPERATIONS: ReadonlySet<string> = new Set(["open", "tab-open", "tab-select", "snapshot", "click", "type", "select", "key", "scroll", "wait", "screenshot", "layout", "viewport", "upload"]);
+const DEADLINE_OPERATIONS: ReadonlySet<string> = new Set(["open", "tab-open", "tab-select", "snapshot", "click", "type", "select", "key", "scroll", "wait", "screenshot", "layout", "viewport", "upload", "committed-origin", "credential-type"]);
 const MAX_DRAIN_MS = 5_000;
 // A qa-layout click keeps its navigation fence armed this long after the click
 // resolves: an off-origin navigation or popup may start just after the event.
@@ -39,7 +39,44 @@ export type InputScope = "full" | "qa-layout";
 // Off-lease requests a qa-layout attach may let through to a listed subresource
 // origin: plain GET loads of these Playwright resource types, never navigation.
 const SUBRESOURCE_TYPES: ReadonlySet<string> = new Set(["stylesheet", "font", "image"]);
-const QA_LAYOUT_DENIED: ReadonlySet<string> = new Set(["type", "select", "key", "upload", "desktop-screenshot", "desktop-click", "desktop-type", "desktop-key", "desktop-scroll", "desktop-launch", "desktop-windows", "desktop-activate"]);
+const QA_LAYOUT_DENIED: ReadonlySet<string> = new Set(["type", "select", "key", "upload", "committed-origin", "credential-type", "desktop-screenshot", "desktop-click", "desktop-type", "desktop-key", "desktop-scroll", "desktop-launch", "desktop-windows", "desktop-activate"]);
+// credential-type types a broker-held secret into one main-frame <input>. The
+// value never leaves the bridge: the only result is {} or a safe error code.
+export type CredentialField = "username" | "password" | "totp";
+// Compared with the browser-normalized HTMLInputElement.type, so a missing,
+// empty or unknown type attribute is "text", exactly as the page renders it.
+const CREDENTIAL_INPUT_TYPES: Readonly<Record<CredentialField, ReadonlySet<string>>> = {
+  password: new Set(["password"]),
+  username: new Set(["text", "email", "tel"]),
+  totp: new Set(["text", "tel", "number"]),
+};
+const MAX_CREDENTIAL_VALUE = 1024;
+// Lowercased substrings that chain selector parts or enter a frame. Without
+// `>>` and `internal:` a Playwright selector is one part, which cannot leave
+// the main frame's document (frame entry is `internal:control=enter-frame`).
+const CREDENTIAL_SELECTOR_DENIED: readonly string[] = [">>", "internal:", "control=", "enter-frame", "any-frame"];
+// The element is proven visible, enabled and editable just before the fill, so
+// the fill needs no actionability wait. A short cap keeps the window in which
+// Playwright re-resolves the selector (and a navigation could land) small, and
+// a fill starts only while this much of the request deadline remains, so an
+// abandoned request can never type after its timeout was answered.
+const CREDENTIAL_FILL_WAIT_MS = 2_000;
+export interface CredentialFieldFacts { input: boolean; type: string; topDocument: boolean; connected: boolean; disabled: boolean; readOnly: boolean }
+// Serialized into the page by locator.evaluate, so it closes over nothing and
+// reads only the element and its own document and window.
+export function probeCredentialField(element: any): CredentialFieldFacts {
+  const doc = element?.ownerDocument;
+  const view = doc?.defaultView;
+  return {
+    input: element?.namespaceURI === "http://www.w3.org/1999/xhtml" && element?.localName === "input",
+    type: String(element?.type ?? "").toLowerCase(),
+    topDocument: Boolean(view) && view.top === view && view.document === doc,
+    connected: element?.isConnected === true,
+    // Fail closed when the element cannot answer: unknown counts as disabled.
+    disabled: typeof element?.matches === "function" ? Boolean(element.matches(":disabled")) : true,
+    readOnly: element?.readOnly === true || (typeof element?.hasAttribute === "function" && Boolean(element.hasAttribute("readonly"))),
+  };
+}
 const LAYOUT_KEYS = ["scrollWidth", "scrollHeight", "clientWidth", "clientHeight", "innerWidth", "innerHeight"] as const;
 const MAX_VIEWPORT = { width: 7680, height: 7680 };
 const MAX_NATIVE_WINDOWS = 4;
@@ -241,6 +278,8 @@ export class BrowserBridge {
       case "network": return this.events(args, "network");
       case "viewport": return this.viewport(args);
       case "upload": return this.upload(args);
+      case "committed-origin": return this.committedOrigin(args);
+      case "credential-type": return this.credentialType(args);
       case "downloads": return this.downloadList(args);
       case "desktop-screenshot": return this.desktopScreenshot(args);
       case "desktop-click": return this.desktopClick(args);
@@ -674,6 +713,82 @@ export class BrowserBridge {
   private async events(args: Record<string, unknown>, type: "console" | "network"): Promise<Record<string, unknown>> { only(args, ["tabId"]); this.requireObservation(); const tabId = args.tabId === undefined ? undefined : this.pageId(this.approvedPage(args.tabId)); const source = type === "console" ? this.consoleEvents : this.networkEvents; return { events: source.filter((event) => tabId === undefined || event.tabId === tabId) }; }
   private async viewport(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "width", "height"]); this.requireInput(); const page = this.approvedPage(args.tabId); const width = number(args.width, 320, MAX_VIEWPORT.width); const height = number(args.height, 240, MAX_VIEWPORT.height); await page.setViewportSize({ width, height }); return { tabId: this.pageId(page), width, height }; }
   private async upload(args: Record<string, unknown>): Promise<Record<string, unknown>> { only(args, ["tabId", "selector", "name", "mimeType", "data"]); this.requireInput(); const page = this.approvedPage(args.tabId); const selector = string(args.selector, MAX_SELECTOR); const name = string(args.name, 128); const mimeType = string(args.mimeType, 128); const data = string(args.data, Math.ceil(MAX_BINARY_BYTES * 4 / 3) + 4); if (!/^[A-Za-z0-9._-]+$/.test(name) || !/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(mimeType)) fail("invalid-request"); let bytes: Buffer; try { bytes = Buffer.from(data, "base64"); } catch { fail("invalid-request"); } if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data) || bytes.length > MAX_BINARY_BYTES) fail("invalid-request"); await page.locator(selector).setInputFiles({ name, mimeType, buffer: bytes }, { timeout: ACTION_WAIT_MS }); return { tabId: this.pageId(page) }; }
+  // The broker's pre-flight read: which approved origin a tab has committed.
+  // It needs no observation or input grant and reveals only a lease origin.
+  private async committedOrigin(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    only(args, ["tabId"]);
+    if (args.tabId === undefined) fail("invalid-request");
+    const attached = this.requireAttachment();
+    const page = this.approvedPage(args.tabId);
+    const origin = this.pageOrigin(page);
+    if (origin === undefined || !attached.origins.has(origin)) fail("permission-denied");
+    return { origin };
+  }
+  private credentialField(value: unknown): CredentialField {
+    if (value !== "username" && value !== "password" && value !== "totp") fail("invalid-request");
+    return value;
+  }
+  private credentialSelector(value: unknown): string {
+    const selector = string(value, MAX_SELECTOR);
+    const lowered = selector.toLowerCase();
+    if (CREDENTIAL_SELECTOR_DENIED.some((token) => lowered.includes(token))) fail("invalid-request");
+    return selector;
+  }
+  private httpsOrigin(value: unknown): string {
+    const raw = string(value, 256);
+    let url: URL;
+    try { url = new URL(raw); } catch { fail("invalid-request"); }
+    // Canonical origins only: no path, userinfo, default port or trailing slash.
+    if (url.protocol !== "https:" || url.origin !== raw) fail("invalid-request");
+    return raw;
+  }
+  private credentialFacts(value: unknown): CredentialFieldFacts {
+    if (!value || typeof value !== "object" || Array.isArray(value)) fail("verification-failed");
+    const facts = value as Record<string, unknown>;
+    for (const key of ["input", "topDocument", "connected", "disabled", "readOnly"] as const) if (typeof facts[key] !== "boolean") fail("verification-failed");
+    if (typeof facts.type !== "string") fail("verification-failed");
+    return { input: facts.input as boolean, type: facts.type, topDocument: facts.topDocument as boolean, connected: facts.connected as boolean, disabled: facts.disabled as boolean, readOnly: facts.readOnly as boolean };
+  }
+  // The host daemon forwards this only from the credential broker's socket under
+  // an active lease on the origin, so it needs no allowInput grant. The bridge is
+  // the last line: the value reaches only one visible, editable main-frame
+  // <input> of a fitting type on the expected, leased origin, and no result or
+  // error code ever carries it.
+  private async credentialType(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + this.requestDeadlineMs;
+    only(args, ["tabId", "field", "selector", "value", "expectOrigin"]);
+    if (args.tabId === undefined) fail("invalid-request");
+    const field = this.credentialField(args.field);
+    const selector = this.credentialSelector(args.selector);
+    const value = string(args.value, MAX_CREDENTIAL_VALUE);
+    const expectOrigin = this.httpsOrigin(args.expectOrigin);
+    const attached = this.requireAttachment();
+    const page = this.approvedPage(args.tabId);
+    const onExpectedOrigin = (): boolean => this.attachment === attached && attached.origins.has(expectOrigin) && this.pageOrigin(page) === expectOrigin;
+    if (!onExpectedOrigin()) fail("permission-denied");
+    // Any main-frame navigation from here on voids the origin check, even one
+    // that lands back on the same origin: the checked document is gone.
+    let navigated = false;
+    const mainFrame = page.mainFrame();
+    const onNavigated = (frame: unknown): void => { if (frame === mainFrame) navigated = true; };
+    page.on("framenavigated", onNavigated);
+    try {
+      const locator = page.locator(selector);
+      if (await locator.count() !== 1) fail("invalid-request");
+      const facts = this.credentialFacts(await locator.evaluate(probeCredentialField));
+      if (!facts.input || !facts.topDocument || !facts.connected || facts.disabled || facts.readOnly || !CREDENTIAL_INPUT_TYPES[field].has(facts.type)) fail("permission-denied");
+      if (await locator.isVisible() !== true) fail("permission-denied");
+      if (this.attachment !== attached) fail("session-lost");
+      if (deadline - Date.now() < CREDENTIAL_FILL_WAIT_MS) fail("timeout");
+      // The last check before the value moves; nothing awaits between it and the fill.
+      if (navigated || !onExpectedOrigin()) fail("permission-denied");
+      await locator.fill(value, { timeout: CREDENTIAL_FILL_WAIT_MS });
+      // A navigation during the fill means the value may have reached the new
+      // document. verification-failed (never {}) tells the broker so.
+      if (navigated || !onExpectedOrigin()) fail("verification-failed");
+      return {};
+    } finally { page.off("framenavigated", onNavigated); }
+  }
   private async downloadList(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     only(args, ["tabId"]); this.requireObservation();
     const tabId = args.tabId === undefined ? undefined : this.pageId(this.approvedPage(args.tabId));

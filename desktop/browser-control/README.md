@@ -88,6 +88,60 @@ parse returns `invalid-request`, not `provider-unavailable`; narrow it, e.g.
 `".gallery-item >> nth=0"`. `provider-unavailable` stays reserved for transport
 and browser failures.
 
+## Credential broker operations
+
+Two operations let a credential broker (a separate host user holding the
+vault) type a username, password or TOTP into a page without the agent ever
+seeing the value. The host control daemon forwards them to the bridge only
+from the broker's socket and only while a scoped lease on that origin is
+active, so neither needs `allowInput` or `allowObservation`. Both need an
+attachment (`session-lost` without one), both are `permission-denied` under
+`inputScope: "qa-layout"`, and both carry the 25 s request deadline. An older
+bridge answers `invalid-request`.
+
+`committed-origin {tabId}` (`tabId` required) returns exactly `{origin}`, the
+origin of that tab's main-frame URL. A tab whose origin is not one of the
+attachment's `origins` is `permission-denied`.
+
+`credential-type {tabId, field, selector, value, expectOrigin}` takes every
+argument, and returns exactly `{}` on success. `field` is `username`,
+`password` or `totp`; `value` is a 1 to 1024 character string with no NUL;
+`expectOrigin` is a canonical `https` origin (no path, trailing slash, userinfo
+or default port). Any other shape is `invalid-request`. The bridge then
+refuses, typing nothing:
+
+- `permission-denied` unless the tab's main-frame origin equals `expectOrigin`
+  and is in the attachment's `origins`.
+- `invalid-request` for a selector containing `>>`, `internal:`, `control=`,
+  `enter-frame` or `any-frame` (compared case-insensitively). A single-part
+  Playwright selector cannot leave the main frame's document; it does pierce
+  open shadow roots, which belong to that document.
+- `invalid-request` unless `page.locator(selector)` matches exactly one element.
+- `permission-denied` unless that element is an HTML `<input>` in the top
+  document that is connected, visible, enabled (including a disabled
+  `<fieldset>`) and not `readonly`, and its browser-normalized `type` fits the
+  field: `password` needs `password`; `username` needs `text`, `email` or `tel`
+  (a missing, empty or unknown `type` is `text`); `totp` needs `text`, `tel` or
+  `number`. The type check uses the property, not the attribute, so
+  `type=" password "` (rendered as text) is refused for a password.
+
+Immediately before `locator.fill(value)` the bridge re-reads the page origin
+and checks that no main-frame navigation happened since the first check, even
+one that came back to the same origin; either is `permission-denied` with
+nothing typed. The fill waits at most 2 s (the element was already proven
+fillable), and it starts only while at least that much of the request deadline
+remains, so a request already answered with `timeout` never types later. If
+the main frame navigates during the fill itself, the result is
+`verification-failed`, never `{}`: the broker should treat that value as
+possibly delivered elsewhere and rotate it.
+
+The value never appears in a result, error code or log line: failures map to
+the existing codes only, and the bridge writes nothing but protocol responses.
+The bridge cannot stop the page itself from revealing a value after the fill
+(a "show password" toggle a later `click` flips, a page that logs or submits
+it), so the daemon should keep agent input and observation off the tab while a
+credential lease is active.
+
 Install the pinned dependency and build from this directory:
 
 ```bash

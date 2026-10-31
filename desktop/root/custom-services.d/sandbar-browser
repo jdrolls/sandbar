@@ -46,9 +46,25 @@ if [[ -z "$chromium_bin" ]]; then
   exit 1
 fi
 
+# Session restore keeps each tab's form state (typed usernames and one-time
+# codes, never passwords) on disk, and after an unclean exit Chromium offers to
+# restore it. Start every browser with no stored session, and never show the
+# crash-restore bubble. Chromium 156 writes Sessions/ and Sessions_Encrypted/;
+# the older single-file names are removed too in case a profile still has
+# them. This runs as abc, so a path planted in the profile cannot steer a root
+# removal.
+s6-setuidgid abc rm -rf -- \
+  /config/sandbar-browser/Default/Sessions \
+  /config/sandbar-browser/Default/Sessions_Encrypted \
+  "/config/sandbar-browser/Default/Current Session" \
+  "/config/sandbar-browser/Default/Current Tabs" \
+  "/config/sandbar-browser/Default/Last Session" \
+  "/config/sandbar-browser/Default/Last Tabs"
+
 exec s6-setuidgid abc env HOME=/config DISPLAY=:1 "$chromium_bin" \
   --user-data-dir=/config/sandbar-browser \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
   --no-first-run \
-  --no-default-browser-check
+  --no-default-browser-check \
+  --hide-crash-restore-bubble

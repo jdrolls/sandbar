@@ -95,7 +95,9 @@ vault) type a username, password or TOTP into a page without the agent ever
 seeing the value. The host control daemon forwards them to the bridge only
 from the broker's socket and only while a scoped lease on that origin is
 active, so neither needs `allowInput` or `allowObservation`. Both need an
-attachment (`session-lost` without one), both are `permission-denied` under
+attachment: `committed-origin` answers `session-lost` without one, and
+`credential-type` answers `permission-denied`, as it does for every failure
+before its fill. Both are `permission-denied` under
 `inputScope: "qa-layout"`, and both carry the 25 s request deadline. An older
 bridge answers `invalid-request`.
 
@@ -124,16 +126,30 @@ refuses, typing nothing:
   (a missing, empty or unknown `type` is `text`); `totp` needs `text`, `tel` or
   `number`. The type check uses the property, not the attribute, so
   `type=" password "` (rendered as text) is refused for a password.
+- `permission-denied` unless the field looks like where that credential
+  belongs. The agent picks the selector, so a field that merely fits the type
+  is not enough: a search box whose script navigates on Enter, or a POST
+  "project name" field that stores what it gets, must never receive a secret.
+  - **`password`:** an `<input type=password>`.
+  - **`username`:** its form owner also has a password input, or it carries
+    `autocomplete` `username` or `email`. A form-less input without that
+    `autocomplete` is refused.
+  - **`totp`:** `autocomplete=one-time-code`, or `inputmode=numeric` with a
+    `maxlength` of 1 to 10, or a form owner with no other text-like control.
 - `permission-denied` for every field when the input's form would submit by
-  GET, which would put the value in the next URL (a search box, say). That
-  covers a form whose method is `get`, missing or invalid (all of these are the
-  GET state), and a `post` form with any associated submitter whose
-  `formmethod` is not `post` or `dialog`. The method is read through the
-  window's own `HTMLFormElement` prototype, so a control named `method` cannot
-  clobber the answer. An unreadable method counts as GET. Inputs outside any
-  form, and `post` or `dialog` forms, are allowed. A single-page login form
-  that omits `method` and submits by script is refused too; give it
-  `method="post"`.
+  GET, which would put the value in the next URL. That covers a form whose
+  method is `get`, missing or invalid (all of these are the GET state), and a
+  `post` form with any associated control whose `formmethod` is not `post` or
+  `dialog`. Inputs outside any form, and `post` or `dialog` forms, are
+  allowed. A single-page login form that omits `method` and submits by script
+  is refused too; give it `method="post"`.
+- The probe reads every fact through the window's native prototypes:
+  attributes via `Element.prototype.getAttribute`, type and form owner via
+  `HTMLInputElement.prototype`, and the form's controls via
+  `HTMLFormElement.prototype.elements`. So a control named `method` or
+  `elements`, or an own property on the element, cannot change the answer, and
+  a form inside a shadow root is scanned in its own tree. A probe that fails
+  part-way refuses.
 - `permission-denied` unless the seat Chromium's credential policy is in effect
   (see below).
 
@@ -145,33 +161,53 @@ fillable), and it starts only while at least that much of the request deadline
 remains, so a request already answered with `timeout` never types later. If
 the main frame navigates during the fill itself, the result is
 `verification-failed`, never `{}`: the broker should treat that value as
-possibly delivered elsewhere and rotate it. `verification-failed` comes only
-from after the fill was sent. Every refusal before it (count, probe,
-visibility, type, GET form, policy, target id, marker write) is
-`permission-denied` or `invalid-request`, so it never raises a false "rotate
-it" alarm.
+possibly delivered elsewhere and rotate it.
+
+Only the fill and the origin check after it may answer anything else, so a
+broker never reads a pre-fill failure as "rotate it". Every failure before the
+fill is `permission-denied`: no attachment, a detach racing the fill, a closed
+page, a timeout, a dead provider, or any refused check. The only exception is
+`invalid-request` for an unknown tab or a selector that does not parse or
+match exactly one element. The work before the fill has its own budget: the
+request deadline less the fill and the selection clear. At the budget it is
+abandoned with `permission-denied`, stops at its next step, and never types.
 
 A filled tab never outlives its lease. Before the value moves, the bridge
-records the tab in memory and marks its document:
+records the tab in three places:
 - **In memory:** the Playwright Page together with the browser's target id.
   The target id stays the same across CDP connections, unlike the Page
   wrapper, so the tab is recognized after a reattach.
+- **On tmpfs:** the target id in `/dev/shm/sandbar-bridge/filled-targets`, so
+  a bridge process started after a crash knows it too. In the seat image
+  `/run` is the overlay, not tmpfs, so the store uses `/dev/shm`. The store is
+  a JSON list in a `0600` file inside a `0700` directory, both owned by the
+  bridge's user. It is written atomically on every fill and every removal and
+  loaded when the process first needs it. A store that exists but is not
+  exactly that (another owner, wider modes, a symlink, malformed content)
+  refuses `attach` with `verification-failed` and refuses fills.
 - **In the document:** a non-enumerable, non-configurable main-world window
   property (`__sandbarCredentialFill`).
 
-If either cannot be recorded, the fill is refused with `permission-denied` and
-nothing is typed. On `detach`, on EOF `shutdown`, and on every `attach` before
-the new attachment can list, select or observe anything, the bridge closes
-every tab this process filled, whether or not it navigated since. A real login
-submit's tab is closed at release too; the session lives on in its cookies.
-It also closes every page whose document still carries the marker, which
-covers a fill by a bridge process that died. The marker survives the process,
-but a cross-document navigation removes it, so after a restart a filled tab
-that had already navigated is not recognized. The GET-form refusal keeps a
-value out of such a tab's URL. A page that cannot answer the bounded checks is
-closed if this process filled it, or at `attach` if it is on one of the new
-lease's origins. If a page that must close cannot be closed, `attach` returns
-`verification-failed`. Within the attachment that did the fill, the bridge
+If any of these cannot be recorded, the fill is refused with
+`permission-denied` and nothing is typed.
+
+On `detach`, on EOF `shutdown`, and on every `attach` (before the new
+attachment can list, select or observe anything), the bridge closes:
+- every tab whose target id is recorded, whether or not it navigated since. A
+  real login submit's tab is closed at release too; the session lives on in
+  its cookies.
+- every page whose document still carries the marker.
+- while any filled tab is recorded, every page that can neither name its
+  target nor answer the marker read, because it may be a recorded tab.
+- at `attach`, any page on one of the new lease's origins that cannot answer
+  the marker read.
+
+A page is kept only when it is provably not a filled tab. Target ids also
+change when Chromium discards and reloads a tab; the document marker and the
+unanswerable-page rule are what cover that case. If a page that must close
+cannot be closed, `attach` returns `verification-failed`. Before closing the
+seat's last tab, the bridge opens a blank one, because headed Chromium quits
+with its last window. Within the attachment that did the fill, the bridge
 does not fence the tab; the daemon's lease fence covers that window.
 
 The seat Chromium must not keep a typed value in its profile. The image ships
@@ -186,15 +222,24 @@ directory of the image's Debian Chromium (verified on 156 in
 | `AutofillAddressEnabled` | `false` | Deprecated in M156 but still applied |
 | `AutofillCreditCardEnabled` | `false` | Deprecated in M156 but still applied |
 | `AutofillSettings` | `[{"url_pattern": "*", "blocked_types": ["all"]}]` | The M156 replacement for the two above; blocks all Autofill saving |
+| `RestoreOnStartup` | `5` | A started browser opens a new tab page, never the last session |
 
 Without this policy, Chromium 156 stores a submitted username in the profile's
 `Web Data` `autofill` table; with it, nothing is stored. `doctor` returns
 `credentialPolicy: true` only when every file in that directory parses, each
 key above is set to exactly that value, and no file contradicts it. It
 reports nothing else about the policy. `credential-type` checks the same
-before every fill. Session restore is a separate store: Chromium writes a
-tab's form state (never password fields) to `Default/Sessions/`, and none of
-these policies change that.
+before every fill.
+
+Session restore is a separate store. Chromium writes each tab's form state,
+never password fields, to `Default/Sessions/` and `Default/Sessions_Encrypted/`.
+A filled login entry lands there once the tab moves on from it, for example
+after a submit. The seat's `sandbar-browser` service therefore deletes both
+directories (and the older `Current Session`, `Current Tabs`, `Last Session`
+and `Last Tabs` files, which Chromium 156 no longer writes) before every
+launch. It deletes them as `abc`, so a path planted in the profile cannot
+steer a root removal. It then launches with `--hide-crash-restore-bubble`, so
+an unclean exit is never followed by an offer to restore.
 
 No value is left in a selection buffer either. On X11, selecting a filled
 field publishes it as PRIMARY, and a cut (Shift+Delete) puts it in CLIPBOARD;

@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import { BrowserBridge, NodeAdapter, redactAriaValues, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
+import { BrowserBridge, NodeAdapter, readCredentialMarker, redactAriaValues, writeCredentialMarker, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
 
 class FakePage {
   events = new Map<string, Function[]>();
@@ -20,8 +20,15 @@ class FakePage {
   emit(name: string, value: unknown): void { for (const callback of this.events.get(name) ?? []) callback(value); }
   url(): string { return this.urlValue; }
   mainFrame(): FakePage { return this; }
-  async close(): Promise<void> { this.closed++; }
-  async goto(url: string): Promise<void> { this.gotoUrls.push(url); this.urlValue = url; }
+  // The main world's credential marker, as writeCredentialMarker/readCredentialMarker see it.
+  credentialMarker = false;
+  markerReadError?: Error;
+  markerWriteResult: unknown = true;
+  closeFailures = 0;
+  async close(): Promise<void> { if (this.closeFailures > 0) { this.closeFailures--; throw new Error("page.close: Protocol error"); } this.closed++; }
+  // A cross-document navigation replaces the document, and with it the marker.
+  async goto(url: string): Promise<void> { this.gotoUrls.push(url); this.urlValue = url; this.credentialMarker = false; }
+  navigate(url: string): void { this.urlValue = url; this.credentialMarker = false; this.emit("framenavigated", this); }
   async bringToFront(): Promise<void> {}
   frames(): FakePage[] { return [this]; }
   ariaTree = '- heading "Welcome" [level=1]\n- link "Pricing":\n  - /url: https://example.test/pricing?token=abc\n- button "Sign in"';
@@ -33,7 +40,11 @@ class FakePage {
   async waitForTimeout(_milliseconds: number): Promise<void> {}
   layoutMetrics: unknown = { scrollWidth: 1440, scrollHeight: 5200, clientWidth: 1440, clientHeight: 900, innerWidth: 1440, innerHeight: 900 };
   evaluated: Function[] = [];
-  async evaluate(fn: Function): Promise<unknown> { this.evaluated.push(fn); return this.layoutMetrics; }
+  async evaluate(fn: Function, arg?: unknown): Promise<unknown> {
+    if (fn === writeCredentialMarker) { expect(arg).toBe("__sandbarCredentialFill"); if (this.markerWriteResult === true) this.credentialMarker = true; return this.markerWriteResult; }
+    if (fn === readCredentialMarker) { expect(arg).toBe("__sandbarCredentialFill"); if (this.markerReadError) throw this.markerReadError; return this.credentialMarker; }
+    this.evaluated.push(fn); return this.layoutMetrics;
+  }
 }
 class FakeWorker {
   constructor(private readonly urlValue: string) {}
@@ -46,7 +57,8 @@ class FakeContext {
   workers: FakeWorker[] = [];
   events = new Map<string, Function[]>();
   allPages: FakePage[] = [this.page];
-  pages(): FakePage[] { return this.allPages; }
+  // As Playwright: a closed page leaves the context's page list.
+  pages(): FakePage[] { return this.allPages.filter((page) => page.closed === 0); }
   serviceWorkers(): FakeWorker[] { return this.workers; }
   async newPage(): Promise<FakePage> { const page = new FakePage("about:blank"); this.allPages.push(page); for (const listener of this.events.get("page") ?? []) listener(page); return page; }
   async route(pattern: string, handler: Function): Promise<void> { this.routes.push({ pattern, handler }); }
@@ -1195,6 +1207,140 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
       release(); await new Promise<void>((resolve) => setTimeout(resolve, 20));
       expect(fills).toEqual([]);
       expect(await bridge.handle(request("next", "committed-origin", { tabId }))).toMatchObject({ ok: true });
+    });
+
+    describe("filled pages outlive no lease", () => {
+      // Sends a request and keeps its response, so each test can prove the canary never left.
+      function recorder(bridge: BrowserBridge) {
+        const responses: BridgeResponse[] = [];
+        const send = async (id: string, operation: string, args: Record<string, unknown>) => { const response = await bridge.handle(request(id, operation, args)); responses.push(response); return response; };
+        return { responses, send };
+      }
+      function observerAttach(bridge: BrowserBridge) { return leaseAttach(bridge, { allowObservation: true }); }
+      function expectNoCanary(responses: BridgeResponse[]): void { expect(responses.length).toBeGreaterThan(0); expect(JSON.stringify(responses)).not.toContain(CANARY); }
+
+      test("the fill marks the page in memory and in its document, before the value moves", async () => {
+        const { bridge, page, tabId } = await leased();
+        let markedAtFill: boolean | undefined;
+        credentialFields(page, { "#password": [{}] }, { onFill: () => { markedAtFill = page.credentialMarker; } });
+        expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toEqual({ id: "fill", ok: true, result: {} });
+        expect(markedAtFill).toBe(true);
+        expect((bridge as any).credentialPages.has(page)).toBe(true);
+      });
+
+      test("a mark that cannot be written refuses the fill", async () => {
+        const { bridge, page, tabId } = await leased();
+        for (const result of [false, undefined, "yes"]) {
+          page.markerWriteResult = result;
+          const fills = credentialFields(page, { "#password": [{}] });
+          expect(await bridge.handle(request("unmarked", "credential-type", credential(tabId)))).toEqual({ id: "unmarked", ok: false, code: "verification-failed" });
+          expect(fills).toEqual([]);
+        }
+        page.markerWriteResult = true;
+        page.evaluate = async () => { throw new TypeError("Cannot redefine property: __sandbarCredentialFill"); };
+        const fills = credentialFields(page, { "#password": [{}] });
+        expect(await bridge.handle(request("redefined", "credential-type", credential(tabId)))).toEqual({ id: "redefined", ok: false, code: "verification-failed" });
+        expect(fills).toEqual([]);
+      });
+
+      test("detach closes an unsubmitted filled page", async () => {
+        const { bridge, page, tabId } = await leased(); const { responses, send } = recorder(bridge);
+        credentialFields(page, { "#password": [{}] });
+        expect(await send("fill", "credential-type", credential(tabId))).toMatchObject({ ok: true });
+        expect(await send("detach", "detach", {})).toEqual({ id: "detach", ok: true, result: { attached: false } });
+        expect(page.closed).toBe(1);
+        expectNoCanary(responses);
+      });
+
+      test("release then reattach closes an unsubmitted filled page before it can be listed or observed", async () => {
+        const { adapter, bridge, page, tabId } = await leased(); const { responses, send } = recorder(bridge);
+        credentialFields(page, { "#password": [{}] });
+        expect(await send("fill", "credential-type", credential(tabId))).toMatchObject({ ok: true });
+        // The close at release fails, so the page outlives the lease with its marker.
+        page.closeFailures = 1;
+        expect(await send("release", "detach", {})).toMatchObject({ ok: true });
+        expect(page.closed).toBe(0); expect(page.credentialMarker).toBe(true);
+        // A new lease with an observation grant on the same origin.
+        expect(await observerAttach(bridge)).toEqual({ id: "attach", ok: true, result: { attached: true, pageCount: 0 } });
+        expect(page.closed).toBe(1);
+        expect(await send("tabs", "tabs", {})).toEqual({ id: "tabs", ok: true, result: { tabs: [] } });
+        expect(await send("shot", "screenshot", { tabId })).toMatchObject({ ok: false, code: "invalid-request" });
+        expect(page.events.get("console") ?? []).toEqual([]);
+        expect(adapter.browser.context.pages()).toEqual([]);
+        expectNoCanary(responses);
+      });
+
+      test("a fresh bridge instance (a restarted daemon) closes a marked page on attach", async () => {
+        const { adapter, bridge, page, tabId } = await leased(); const { responses, send } = recorder(bridge);
+        credentialFields(page, { "#password": [{}] });
+        expect(await send("fill", "credential-type", credential(tabId))).toMatchObject({ ok: true });
+        // The old bridge process is gone without detach; only the document marker remains.
+        const foreignMarked = new FakePage("https://elsewhere.test/login"); foreignMarked.credentialMarker = true;
+        const unrelated = new FakePage("https://elsewhere.test/news");
+        adapter.browser.context.allPages.push(foreignMarked, unrelated);
+        const restarted = new BrowserBridge(adapter); const after = recorder(restarted);
+        expect(await observerAttach(restarted)).toEqual({ id: "attach", ok: true, result: { attached: true, pageCount: 0 } });
+        expect(page.closed).toBe(1); expect(foreignMarked.closed).toBe(1); expect(unrelated.closed).toBe(0);
+        expect(await after.send("tabs", "tabs", {})).toEqual({ id: "tabs", ok: true, result: { tabs: [] } });
+        expect(await after.send("origin", "committed-origin", { tabId })).toMatchObject({ ok: false, code: "invalid-request" });
+        expectNoCanary([...responses, ...after.responses]);
+      });
+
+      test("a page whose main frame navigated after the fill (a real submit) survives release and is listed again", async () => {
+        const { bridge, page, tabId } = await leased(); const { responses, send } = recorder(bridge);
+        credentialFields(page, { "#password": [{}] });
+        expect(await send("fill", "credential-type", credential(tabId))).toMatchObject({ ok: true });
+        page.navigate("https://example.test/welcome");
+        expect(await send("release", "detach", {})).toMatchObject({ ok: true });
+        expect(page.closed).toBe(0);
+        expect(await observerAttach(bridge)).toMatchObject({ ok: true, result: { pageCount: 1 } });
+        expect(await send("tabs", "tabs", {})).toEqual({ id: "tabs", ok: true, result: { tabs: [{ tabId, selected: false }] } });
+        expect((bridge as any).credentialPages.has(page)).toBe(false);
+        expectNoCanary(responses);
+      });
+
+      test("a same-document navigation keeps the filled document, so the page still closes", async () => {
+        const { bridge, page, tabId } = await leased();
+        credentialFields(page, { "#password": [{}] });
+        expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toMatchObject({ ok: true });
+        page.urlValue = "https://example.test/login#step-2"; page.emit("framenavigated", page);
+        expect(await bridge.handle(request("release", "detach", {}))).toMatchObject({ ok: true });
+        expect(page.closed).toBe(1);
+      });
+
+      test("shutdown closes an unsubmitted filled page", async () => {
+        const { bridge, page, tabId } = await leased();
+        credentialFields(page, { "#password": [{}] });
+        expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toMatchObject({ ok: true });
+        await bridge.shutdown();
+        expect(page.closed).toBe(1);
+      });
+
+      test("a page that cannot answer the marker read is closed when this process marked it or it is on the new lease", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        credentialFields(page, { "#password": [{}] });
+        expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toMatchObject({ ok: true });
+        page.markerReadError = new Error("Execution context was destroyed");
+        expect(await bridge.handle(request("release", "detach", {}))).toMatchObject({ ok: true });
+        expect(page.closed).toBe(1);
+
+        // A fresh process has no memory: an unanswerable leased-origin page closes, an unanswerable outside one stays.
+        const leasedSilent = new FakePage("https://example.test/other"); leasedSilent.markerReadError = new Error("Target crashed");
+        const outsideSilent = new FakePage("https://elsewhere.test/"); outsideSilent.markerReadError = new Error("Target crashed");
+        adapter.browser.context.allPages.push(leasedSilent, outsideSilent);
+        expect(await observerAttach(new BrowserBridge(adapter))).toMatchObject({ ok: true, result: { pageCount: 0 } });
+        expect(leasedSilent.closed).toBe(1); expect(outsideSilent.closed).toBe(0);
+      });
+
+      test("attach refuses while a marked page cannot be closed, and a retry closes it", async () => {
+        configured(); const adapter = new FakeAdapter(); const page = adapter.browser.context.page;
+        page.credentialMarker = true; page.closeFailures = 1;
+        const bridge = new BrowserBridge(adapter);
+        expect(await observerAttach(bridge)).toEqual({ id: "attach", ok: false, code: "verification-failed" });
+        expect(adapter.browser.closedConnections).toBe(1); expect(adapter.browser.context.routes).toEqual([]);
+        expect(await observerAttach(bridge)).toMatchObject({ ok: true, result: { pageCount: 0 } });
+        expect(page.closed).toBe(1);
+      });
     });
 
     test("the canary value never appears in any response or console line, success or failure", async () => {

@@ -135,6 +135,25 @@ the main frame navigates during the fill itself, the result is
 `verification-failed`, never `{}`: the broker should treat that value as
 possibly delivered elsewhere and rotate it.
 
+A filled page never outlives its lease. Before the value moves, the bridge
+marks the page in memory and in its document, as a non-enumerable,
+non-configurable main-world window property (`__sandbarCredentialFill`). If
+the mark cannot be written, the fill is refused with `verification-failed` and
+nothing is typed. The document marker survives the bridge process dying, and a
+cross-document main-frame navigation (a real submit) removes it with the old
+document. A same-document navigation (`pushState`, a hash change) does not.
+On `detach` and on EOF `shutdown`, the bridge closes every page whose document
+still carries the marker, or that this process marked and that cannot answer
+the bounded marker read. Every `attach` first reads the marker in every page
+and closes each marked page before the new attachment can list, select or
+observe it. A page on one of the new lease's origins that cannot answer the
+read is closed too, because nothing can prove it is clean. If a page that must
+close cannot be closed, `attach` returns `verification-failed`. A page that
+navigated after the fill is left open and listed normally. A single-page login
+that submits without a cross-document navigation keeps its marker, so its tab
+is closed at release. Within the attachment that did the fill, the bridge does
+not fence the page; the daemon's lease fence covers that window.
+
 The value never appears in a result, error code or log line: failures map to
 the existing codes only, and the bridge writes nothing but protocol responses.
 The bridge cannot stop the page itself from revealing a value after the fill

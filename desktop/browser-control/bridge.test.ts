@@ -93,6 +93,17 @@ class FakeAdapter implements BridgeAdapter {
   desktopCalls: Array<{ command: string; args: string[] }> = [];
   nativeInputCalls: Array<{ xWindowId: string; pid: number; operation: string; values: string[] }> = [];
   nativeInputFailure?: Error;
+  // Each clearSelections call records whether the context's page observers were installed yet.
+  selectionClears: Array<{ observersInstalled: boolean }> = [];
+  clearFailure?: Error;
+  pendingClear?: Promise<void>;
+  onClear?: () => void;
+  async clearSelections(): Promise<void> {
+    this.selectionClears.push({ observersInstalled: (this.browser.context.events.get("page") ?? []).length > 0 });
+    this.onClear?.();
+    if (this.pendingClear) return this.pendingClear;
+    if (this.clearFailure) throw this.clearFailure;
+  }
   private readonly png = Buffer.from("89504e470d0a1a0a0000000d494844520000000200000003080600000000000000", "hex");
   async connect(): Promise<FakeBrowser> {
     if (!this.reconnectWithFreshWrappers) return this.browser;
@@ -1340,6 +1351,114 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
         expect(adapter.browser.closedConnections).toBe(1); expect(adapter.browser.context.routes).toEqual([]);
         expect(await observerAttach(bridge)).toMatchObject({ ok: true, result: { pageCount: 0 } });
         expect(page.closed).toBe(1);
+      });
+    });
+
+    describe("seat X selections", () => {
+      test("attach clears both selections before any page observer exists or a page is listed", async () => {
+        configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter);
+        expect(await leaseAttach(bridge, { allowObservation: true })).toMatchObject({ ok: true });
+        expect(adapter.selectionClears).toEqual([{ observersInstalled: false }]);
+      });
+
+      test("attach refuses, and closes its connection, when the selections cannot be cleared; a retry attaches", async () => {
+        configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, undefined, 20);
+        adapter.clearFailure = new Error("xsel: Can't open display: :1");
+        expect(await leaseAttach(bridge, { allowObservation: true })).toEqual({ id: "attach", ok: false, code: "verification-failed" });
+        expect(adapter.browser.closedConnections).toBe(1); expect(adapter.browser.context.routes).toEqual([]);
+        expect(await bridge.handle(request("tabs", "tabs", {}))).toMatchObject({ ok: false, code: "session-lost" });
+        // A clear that hangs is bounded and refuses the same way.
+        adapter.clearFailure = undefined; adapter.pendingClear = new Promise<void>(() => {});
+        const started = Date.now();
+        expect(await leaseAttach(bridge, { allowObservation: true })).toEqual({ id: "attach", ok: false, code: "verification-failed" });
+        expect(Date.now() - started).toBeLessThan(1_000);
+        adapter.pendingClear = undefined;
+        expect(await leaseAttach(bridge, { allowObservation: true })).toMatchObject({ ok: true, result: { attached: true } });
+      });
+
+      test("each dispatched fill is followed by a clear, on success and on failure", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        const order: string[] = []; adapter.onClear = () => order.push("clear");
+        credentialFields(page, { "#password": [{}] }, { onFill: () => order.push("fill") });
+        adapter.selectionClears = [];
+        expect(await bridge.handle(request("ok", "credential-type", credential(tabId)))).toEqual({ id: "ok", ok: true, result: {} });
+        expect(order).toEqual(["fill", "clear"]);
+        credentialFields(page, { "#password": [{}] }, { onFill: () => order.push("fill"), fillError: new Error("locator.fill: Target page, context or browser has been closed") });
+        expect(await bridge.handle(request("failed", "credential-type", credential(tabId)))).toEqual({ id: "failed", ok: false, code: "session-lost" });
+        expect(order).toEqual(["fill", "clear", "fill", "clear"]);
+        credentialFields(page, { "#password": [{}] }, { onFill: () => { order.push("fill"); page.urlValue = "https://other.test/"; } });
+        expect(await bridge.handle(request("moved", "credential-type", credential(tabId)))).toEqual({ id: "moved", ok: false, code: "verification-failed" });
+        expect(order).toEqual(["fill", "clear", "fill", "clear", "fill", "clear"]);
+      });
+
+      test("a refusal before the fill is dispatched does not need a clear", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        credentialFields(page, { "#password": [{ type: "text" }] }); adapter.selectionClears = [];
+        expect(await bridge.handle(request("unfit", "credential-type", credential(tabId)))).toMatchObject({ ok: false, code: "permission-denied" });
+        expect(adapter.selectionClears).toEqual([]);
+      });
+
+      test("a failed or hung clear after a fill is best effort and bounded", async () => {
+        configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, undefined, 20);
+        expect(await leaseAttach(bridge)).toMatchObject({ ok: true });
+        const page = adapter.browser.context.page; const tabId = tabIdOf(bridge, page);
+        const fills = credentialFields(page, { "#password": [{}] });
+        adapter.clearFailure = new Error("xsel failed");
+        expect(await bridge.handle(request("clear-failed", "credential-type", credential(tabId)))).toEqual({ id: "clear-failed", ok: true, result: {} });
+        adapter.clearFailure = undefined; adapter.pendingClear = new Promise<void>(() => {});
+        const started = Date.now();
+        expect(await bridge.handle(request("clear-hung", "credential-type", credential(tabId)))).toEqual({ id: "clear-hung", ok: true, result: {} });
+        expect(Date.now() - started).toBeLessThan(1_000);
+        expect(fills).toHaveLength(2);
+      });
+
+      test("detach clears the selections, best effort and bounded", async () => {
+        configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter, undefined, undefined, 20);
+        expect(await leaseAttach(bridge)).toMatchObject({ ok: true }); adapter.selectionClears = [];
+        expect(await bridge.handle(request("detach", "detach", {}))).toEqual({ id: "detach", ok: true, result: { attached: false } });
+        expect(adapter.selectionClears).toHaveLength(1);
+        expect(await leaseAttach(bridge)).toMatchObject({ ok: true });
+        adapter.clearFailure = new Error("xsel failed");
+        expect(await bridge.handle(request("detach-failed", "detach", {}))).toEqual({ id: "detach-failed", ok: true, result: { attached: false } });
+        adapter.clearFailure = undefined;
+        expect(await leaseAttach(bridge)).toMatchObject({ ok: true });
+        adapter.pendingClear = new Promise<void>(() => {});
+        const started = Date.now();
+        expect(await bridge.handle(request("detach-hung", "detach", {}))).toEqual({ id: "detach-hung", ok: true, result: { attached: false } });
+        expect(Date.now() - started).toBeLessThan(1_000);
+        expect(adapter.browser.closedConnections).toBe(3);
+      });
+
+      test("shutdown clears the selections, attached or not, and a failure does not stop it", async () => {
+        configured();
+        const attachedAdapter = new FakeAdapter(); const attached = new BrowserBridge(attachedAdapter);
+        expect(await leaseAttach(attached)).toMatchObject({ ok: true }); attachedAdapter.selectionClears = [];
+        attachedAdapter.clearFailure = new Error("xsel failed");
+        await attached.shutdown();
+        expect(attachedAdapter.selectionClears).toHaveLength(1); expect(attachedAdapter.browser.closedConnections).toBe(1);
+        const idleAdapter = new FakeAdapter(); const idle = new BrowserBridge(idleAdapter);
+        await idle.shutdown();
+        expect(idleAdapter.selectionClears).toHaveLength(1);
+      });
+
+      test("the production clear runs fixed xsel argv on :1 and requires both selections to read back empty", async () => {
+        const calls: Array<{ file: string; args: string[]; options: any }> = []; let leftover = "";
+        const exec = spyOn(childProcess, "execFile").mockImplementation((file: any, args: any, options: any, callback: any) => {
+          calls.push({ file, args, options });
+          callback(null, Buffer.from(args.includes("--output") && args[0] === "--primary" ? leftover : ""), Buffer.alloc(0)); return {} as any;
+        });
+        try {
+          await new NodeAdapter().clearSelections();
+          expect(calls.map((call) => [call.file, ...call.args])).toEqual([
+            ["/usr/bin/xsel", "--clipboard", "--clear"], ["/usr/bin/xsel", "--clipboard", "--output", "--selectionTimeout", "500"],
+            ["/usr/bin/xsel", "--primary", "--clear"], ["/usr/bin/xsel", "--primary", "--output", "--selectionTimeout", "500"],
+          ]);
+          for (const call of calls) expect(call.options).toEqual({ encoding: "buffer", timeout: 1_000, maxBuffer: 64 * 1024, env: { PATH: "/usr/bin:/bin", DISPLAY: ":1", HOME: "/config" } });
+          leftover = CANARY;
+          const failure = await new NodeAdapter().clearSelections().then(() => undefined, (error: Error) => error);
+          expect(failure?.message).toBe("selection not empty after clear");
+          expect(String(failure)).not.toContain(CANARY);
+        } finally { exec.mockRestore(); }
       });
     });
 

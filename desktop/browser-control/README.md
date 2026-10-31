@@ -154,6 +154,23 @@ that submits without a cross-document navigation keeps its marker, so its tab
 is closed at release. Within the attachment that did the fill, the bridge does
 not fence the page; the daemon's lease fence covers that window.
 
+No value is left in a selection buffer either. On X11, selecting a filled
+field publishes it as PRIMARY, and a cut (Shift+Delete) puts it in CLIPBOARD;
+both outlive the tab. The bridge clears both selections on the seat display
+`:1` after every dispatched fill (whatever its outcome), on `detach`, on EOF
+`shutdown` (attached or not), and on `attach` before any page observer exists
+or a page is listed. It runs fixed `/usr/bin/xsel --clipboard|--primary
+--clear` argv, which sets each owner to None so Chromium drops its own copy,
+then reads each selection back and requires it empty. The read-back bytes are
+only measured, never returned or logged. Each clear is bounded (1 s per xsel
+call, 5 s in total). At `attach`, a clear that fails or times out returns
+`verification-failed`. After a fill, at `detach` and at `shutdown` it is best
+effort, and the next `attach` clears again. CDP has no clipboard command short
+of granting page script clipboard permissions, so the clear works at the X
+level. In headed X11 Chromium that empties the browser's clipboard too. The
+bridge cannot reach a copy the stream server (Selkies) has already synced to a
+connected viewer, nor one a viewer later pushes back into the seat.
+
 The value never appears in a result, error code or log line: failures map to
 the existing codes only, and the bridge writes nothing but protocol responses.
 The bridge cannot stop the page itself from revealing a value after the fill

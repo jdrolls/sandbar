@@ -57,10 +57,11 @@ const MAX_CREDENTIAL_VALUE = 1024;
 const CREDENTIAL_SELECTOR_DENIED: readonly string[] = [">>", "internal:", "control=", "enter-frame", "any-frame"];
 // The element is proven visible, enabled and editable just before the fill, so
 // the fill needs no actionability wait. A short cap keeps the window in which
-// Playwright re-resolves the selector (and a navigation could land) small, and
-// a fill starts only while this much of the request deadline remains, so an
-// abandoned request can never type after its timeout was answered.
+// Playwright re-resolves the selector (and a navigation could land) small.
 const CREDENTIAL_FILL_WAIT_MS = 2_000;
+// A fill starts only while the fill and the bounded selection clear after it
+// still fit in the request deadline, so an abandoned request can never type
+// after its timeout was answered, and a successful one answers {} in time.
 // A page that may hold an unsubmitted credential carries this main-world window
 // property. It lives in the document, so it survives the bridge process dying
 // and a cross-document main-frame navigation (a real submit) removes it. Each
@@ -97,7 +98,16 @@ const MAX_NATIVE_WINDOWS = 4;
 const MAX_NATIVE_TEXT = 4096;
 const NATIVE_WINDOW_WAIT_MS = 5_000;
 const NATIVE_POLL_MS = 100;
-const CDP_METADATA_URL = "http://127.0.0.1:9222/json/version";
+// X selections on the seat display. A cut or a plain selection of a filled
+// field lands the value in CLIPBOARD or PRIMARY, which outlive the tab. The
+// image's xsel (1.2.1) clears each by setting its owner to None, which makes
+// the owning client (Chromium) drop its copy, then reads it back to confirm.
+const SEAT_DISPLAY = ":1";
+const SEAT_XSEL = "/usr/bin/xsel";
+const SELECTION_COMMAND_TIMEOUT_MS = 1_000;
+const SELECTION_READBACK_TIMEOUT_MS = 500;
+const MAX_SELECTION_READBACK = 64 * 1024;
+const CDP_METADATA_URL ="http://127.0.0.1:9222/json/version";
 const MAX_CDP_METADATA_BYTES = 16 * 1024;
 const CDP_METADATA_TIMEOUT_MS = 5_000;
 const opaqueId = (): string => createHash("sha256").update(randomBytes(32)).digest("hex");
@@ -129,6 +139,20 @@ export interface BridgeAdapter {
   // server grab until its normal timeout.
   cancelNativeInputs?(): void;
   launchMousepad(): Promise<LaunchedMousepad>;
+  // Empties the seat display's CLIPBOARD and PRIMARY selections and confirms
+  // both read back empty; rejects otherwise. Never returns selection contents.
+  clearSelections(): Promise<void>;
+}
+
+// Clears CLIPBOARD and PRIMARY with fixed xsel argv, then reads each back and
+// requires it empty. The read-back bytes are only measured, then dropped.
+export async function clearSeatSelections(xsel = SEAT_XSEL, display = SEAT_DISPLAY): Promise<void> {
+  const options: ExecFileOptions = { encoding: "buffer", timeout: SELECTION_COMMAND_TIMEOUT_MS, maxBuffer: MAX_SELECTION_READBACK, env: { PATH: "/usr/bin:/bin", DISPLAY: display, HOME: "/config" } };
+  for (const selection of ["--clipboard", "--primary"]) {
+    await execFile(xsel, [selection, "--clear"], options);
+    const remaining = await execFile(xsel, [selection, "--output", "--selectionTimeout", String(SELECTION_READBACK_TIMEOUT_MS)], options);
+    if (remaining.length > 0) throw new Error("selection not empty after clear");
+  }
 }
 
 class BridgeFailure extends Error {
@@ -231,7 +255,7 @@ export class BrowserBridge {
   private dispatch: Promise<void> = Promise.resolve();
   private ending = false;
 
-  constructor(private readonly adapter: BridgeAdapter, private readonly requestDeadlineMs = REQUEST_DEADLINE_MS, private readonly clickSettleMs = CLICK_SETTLE_MS) {}
+  constructor(private readonly adapter: BridgeAdapter, private readonly requestDeadlineMs = REQUEST_DEADLINE_MS, private readonly clickSettleMs = CLICK_SETTLE_MS, private readonly selectionClearMs = MAX_DRAIN_MS) {}
 
   handle(request: unknown): Promise<BridgeResponse> {
     if (this.ending) return Promise.resolve({ id: "invalid", ok: false, code: "session-lost" });
@@ -357,10 +381,10 @@ export class BrowserBridge {
     if (typeof browser.close !== "function") fail("unsupported-capability");
     await browser.close();
   }
-  private async bounded<T>(work: Promise<T>, code: ErrorCode): Promise<T> {
+  private async bounded<T>(work: Promise<T>, code: ErrorCode, limitMs = MAX_DRAIN_MS): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await Promise.race([work, new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new BridgeFailure(code)), MAX_DRAIN_MS); })]);
+      return await Promise.race([work, new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new BridgeFailure(code)), limitMs); })]);
     } finally { if (timer) clearTimeout(timer); }
   }
   private assertUrl(value: unknown, origins: Set<string>): string {
@@ -425,6 +449,11 @@ export class BrowserBridge {
     // select or observe it. A leased-origin page that cannot answer is treated
     // as marked; one that cannot be closed refuses the attach.
     try { await this.closeCredentialPages(context.pages(), (page) => origins.has(this.pageOrigin(page) ?? "")); }
+    catch { await this.closeConnection(browser).catch(() => undefined); fail("verification-failed"); }
+    // An earlier lease may have cut or selected a value into the seat's X
+    // selections. They must be empty before this attachment can paste;
+    // a selection that cannot be cleared refuses the attach.
+    try { await this.clearSelections(); }
     catch { await this.closeConnection(browser).catch(() => undefined); fail("verification-failed"); }
     const routeHandler = async (route: any): Promise<void> => {
       const request = route.request();
@@ -611,6 +640,9 @@ export class BrowserBridge {
     // Best effort: a page that cannot be closed now keeps its document marker,
     // and the next attach closes it before anything can list it.
     await this.bounded(this.closeCredentialPages(attached.context.pages(), () => false), "session-lost").catch(() => undefined);
+    // Best effort and bounded, like the page sweep; the next attach clears
+    // again and refuses if it cannot.
+    await this.clearSelections().catch(() => undefined);
     try { await this.bounded(this.releaseAttachment(attached, false), "session-lost"); }
     catch { await this.closeConnection(attached.browser).catch(() => undefined); this.clearBuffers(); fail("session-lost"); }
     this.clearBuffers();
@@ -631,10 +663,17 @@ export class BrowserBridge {
     // Only launch capabilities held by this bridge are terminated. This never
     // searches for or signals a desktop process by a caller-provided PID.
     await this.stopLaunchedMousepads().catch(() => undefined);
-    if (!attached) return;
     // Bounded, then CDP closes regardless; a page left open keeps its marker.
-    await this.bounded(this.closeCredentialPages(attached.context.pages(), () => false), "session-lost").catch(() => undefined);
+    if (attached) await this.bounded(this.closeCredentialPages(attached.context.pages(), () => false), "session-lost").catch(() => undefined);
+    // Cleared even with no attachment: a failed clear at an earlier detach
+    // must not leave a value for whatever this seat runs next.
+    await this.clearSelections().catch(() => undefined);
+    if (!attached) return;
     await this.bounded(this.releaseAttachment(attached, true), "session-lost").catch(() => undefined);
+  }
+  // Bounded so a wedged X server can never hold a detach, shutdown or fill open.
+  private async clearSelections(): Promise<void> {
+    await this.bounded(Promise.resolve().then(() => this.adapter.clearSelections()), "provider-unavailable", this.selectionClearMs);
   }
   // true: the page's document holds the marker; false: it provably does not;
   // undefined: the page could not answer in time (closed, crashed, wedged).
@@ -842,10 +881,13 @@ export class BrowserBridge {
       try { marked = await page.evaluate(writeCredentialMarker, CREDENTIAL_MARKER); } catch { fail("verification-failed"); }
       if (marked !== true) fail("verification-failed");
       if (this.attachment !== attached) fail("session-lost");
-      if (deadline - Date.now() < CREDENTIAL_FILL_WAIT_MS) fail("timeout");
+      if (deadline - Date.now() < CREDENTIAL_FILL_WAIT_MS + this.selectionClearMs) fail("timeout");
       // The last check before the value moves; nothing awaits between it and the fill.
       if (navigated || !onExpectedOrigin()) fail("permission-denied");
-      await locator.fill(value, { timeout: CREDENTIAL_FILL_WAIT_MS });
+      // Once the fill is dispatched, the selections are cleared whatever its
+      // outcome: fill selects the field, and X11 publishes a selection as PRIMARY.
+      try { await locator.fill(value, { timeout: CREDENTIAL_FILL_WAIT_MS }); }
+      finally { await this.clearSelections().catch(() => undefined); }
       // A navigation during the fill means the value may have reached the new
       // document. verification-failed (never {}) tells the broker so.
       if (navigated || !onExpectedOrigin()) fail("verification-failed");
@@ -1155,6 +1197,7 @@ export class NodeAdapter implements BridgeAdapter {
     if (command === "scrot") return this.scrot(args);
     return execFile(command, args, { encoding: "buffer", maxBuffer: maxBytes, timeout: MAX_DRAIN_MS, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", DISPLAY: ":1", HOME: "/config" } });
   }
+  clearSelections(): Promise<void> { return clearSeatSelections(); }
   async launchMousepad(): Promise<LaunchedMousepad> {
     // Mousepad restores its previous session from XDG state. Give this child a
     // private, bridge-created profile instead of allowing it to read or mutate

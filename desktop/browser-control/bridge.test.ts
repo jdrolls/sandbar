@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import { BrowserBridge, CHROMIUM_MANAGED_POLICY_DIR, CREDENTIAL_POLICY, FILLED_TARGETS_DIR, NodeAdapter, credentialPolicyHolds, loadFilledTargetIds, saveFilledTargetIds, probeCredentialField, readCredentialMarker, readCredentialPolicy, redactAriaValues, writeCredentialMarker, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
+import { BrowserBridge, CHROMIUM_MANAGED_POLICY_DIR, CREDENTIAL_POLICY, FILLED_TARGETS_DIR, NodeAdapter, credentialPolicyHolds, loadFilledTargetIds, saveFilledTargetIds, probeCredentialField, probeSubmitControl, readCredentialMarker, readCredentialPolicy, redactAriaValues, writeCredentialMarker, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
 
 class FakePage {
   events = new Map<string, Function[]>();
@@ -1045,52 +1045,87 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     // carries decoy own properties (type, form, localName, method, elements), as page script or a control named
     // "method" or "elements" would add, which a probe that skipped the prototypes would read instead.
     // `form` is the input's form owner (absent: no form); `method` is its method attribute (absent: none);
-    // `controls` are its other associated controls; `prototypes: false` removes HTMLFormElement, as a broken page would.
+    // `controls` are its other associated controls (an <input type=image> is left out of form.elements, as browsers
+    // do, and found only by walking the form's tree); `shadow` puts the form in a shadow root;
+    // `prototypes: false` removes HTMLFormElement, as a broken page would.
     // `autocomplete` defaults to "username one-time-code" so a default field fits every kind; null removes it.
+    // `submit` builds a control for the optional submit selector: `type` is the native (normalized) type, `form`
+    // says whose form owner it has, `count` repeats it, `otherDocument` builds it in another document.
     interface FakeControl { localName?: string; type?: string; formmethod?: string }
-    interface FakeForm { method?: string; controls?: FakeControl[]; prototypes?: false }
-    interface FakeField { localName?: string; type?: string; topDocument?: boolean; connected?: boolean; disabled?: boolean; readOnly?: boolean; visible?: boolean; form?: FakeForm; autocomplete?: string | null; inputMode?: string; maxLength?: string }
+    interface FakeForm { method?: string; controls?: FakeControl[]; prototypes?: false; shadow?: true }
+    interface FakeSubmit { localName?: string; type?: string; form?: "same" | "other" | "none"; count?: number; otherDocument?: true }
+    interface FakeField { localName?: string; type?: string; topDocument?: boolean; connected?: boolean; disabled?: boolean; readOnly?: boolean; visible?: boolean; form?: FakeForm; autocomplete?: string | null; inputMode?: string; maxLength?: string; submit?: FakeSubmit }
     interface FieldHooks { onEvaluate?: () => void; onVisible?: () => void; onFill?: () => void; count?: () => Promise<number>; fillError?: Error }
-    interface FakeNodeState { localName: string; type: string; attributes: Record<string, string>; form: object | null; connected: boolean; disabled: boolean; controls: object[] }
+    interface FakeNodeState { localName: string; type: string; attributes: Record<string, string>; form: object | null; connected: boolean; disabled: boolean; controls: object[]; root: object; document: object }
+    const submitControls = new WeakMap<object, object[]>();
     function probeCredentialFieldOf(field: FakeField) { return probeCredentialField(fakeElement(field)); }
     function fakeElement(field: FakeField): unknown {
       const doc: Record<string, unknown> = {}; const view: Record<string, any> = { document: doc };
       view.top = field.topDocument === false ? {} : view; doc.defaultView = view;
+      const otherDoc: Record<string, unknown> = { defaultView: view };
+      const shadowRoot = {};
       const states = new WeakMap<object, FakeNodeState>();
-      const state = (node: object): FakeNodeState => states.get(node)!;
+      const nodes: object[] = [];
+      const state = (target: object): FakeNodeState => states.get(target)!;
       const node = (initial: Partial<FakeNodeState>): object => {
-        const created = { ownerDocument: doc, type: "password", form: "decoy", localName: "decoy", method: "post", elements: [] };
-        states.set(created, { localName: "input", type: "text", attributes: {}, form: null, connected: true, disabled: false, controls: [], ...initial });
+        const document = initial.document ?? doc;
+        const created = { ownerDocument: document, type: "password", form: "decoy", localName: "decoy", method: "post", elements: [] };
+        states.set(created, { localName: "input", type: "text", attributes: {}, form: null, connected: true, disabled: false, controls: [], root: document, document, ...initial });
+        nodes.push(created);
         return created;
       };
       const getters = (target: object, entries: Record<string, (this: object) => unknown>): object => { for (const [name, get] of Object.entries(entries)) Object.defineProperty(target, name, { get }); return target; };
+      const inputsIn = (root: object) => nodes.filter((candidate) => state(candidate).root === root && state(candidate).localName === "input");
       view.Element = { prototype: getters({
         getAttribute(this: object, name: string) { return state(this).attributes[name] ?? null; },
         hasAttribute(this: object, name: string) { return Object.hasOwn(state(this).attributes, name); },
         matches(this: object, query: string) { expect(query).toBe(":disabled"); return state(this).disabled; },
       }, { localName() { return state(this).localName; }, namespaceURI() { return "http://www.w3.org/1999/xhtml"; } }) };
-      view.Node = { prototype: getters({}, { isConnected() { return state(this).connected; } }) };
+      view.Node = { prototype: getters({ getRootNode(this: object) { return state(this).root; } }, { isConnected() { return state(this).connected; }, ownerDocument() { return state(this).document; } }) };
+      view.Document = { prototype: { querySelectorAll(this: object, query: string) { expect(this).toBe(doc); expect(query).toBe("input"); return inputsIn(doc); } } };
+      view.DocumentFragment = { prototype: { querySelectorAll(this: object, query: string) { expect(this).toBe(shadowRoot); expect(query).toBe("input"); return inputsIn(shadowRoot); } } };
       view.HTMLInputElement = { prototype: getters({}, { type() { return state(this).type; }, form() { return state(this).form; } }) };
-      if (field.form?.prototypes !== false) view.HTMLFormElement = { prototype: getters({}, { elements() { return state(this).controls; } }) };
-      const form = field.form ? node({ localName: "form", attributes: field.form.method === undefined ? {} : { method: field.form.method } }) : null;
+      view.HTMLButtonElement = { prototype: getters({}, { type() { return state(this).type; }, form() { return state(this).form; } }) };
+      // As browsers do, form.elements leaves out <input type=image>.
+      if (field.form?.prototypes !== false) view.HTMLFormElement = { prototype: getters({}, { elements() { return state(this).controls.filter((control) => !(state(control).localName === "input" && state(control).type === "image")); } }) };
+      const root = field.form?.shadow ? shadowRoot : doc;
+      const form = field.form ? node({ localName: "form", attributes: field.form.method === undefined ? {} : { method: field.form.method }, root }) : null;
       const attributes: Record<string, string> = {};
       const autocomplete = field.autocomplete === undefined ? "username one-time-code" : field.autocomplete;
       if (autocomplete !== null) attributes.autocomplete = autocomplete;
       if (field.inputMode !== undefined) attributes.inputmode = field.inputMode;
       if (field.maxLength !== undefined) attributes.maxlength = field.maxLength;
       if (field.readOnly) attributes.readonly = "";
-      const element = node({ localName: field.localName ?? "input", type: field.type ?? "password", attributes, form, connected: field.connected ?? true, disabled: field.disabled ?? false });
+      const element = node({ localName: field.localName ?? "input", type: field.type ?? "password", attributes, form, connected: field.connected ?? true, disabled: field.disabled ?? false, root });
       if (form) {
-        const controls = (field.form!.controls ?? []).map((control) => node({ localName: control.localName ?? "input", type: control.type ?? "text", attributes: control.formmethod === undefined ? {} : { formmethod: control.formmethod }, form }));
+        const controls = (field.form!.controls ?? []).map((control) => node({ localName: control.localName ?? "input", type: control.type ?? "text", attributes: control.formmethod === undefined ? {} : { formmethod: control.formmethod }, form, root }));
         state(form).controls = [element, ...controls];
+      }
+      if (field.submit) {
+        const spec = field.submit;
+        const otherForm = node({ localName: "form", attributes: { method: "post" }, root });
+        const owner = spec.form === "other" ? otherForm : spec.form === "none" ? null : form;
+        const document = spec.otherDocument ? otherDoc : doc;
+        submitControls.set(element, Array.from({ length: spec.count ?? 1 }, () => node({ localName: spec.localName ?? "button", type: spec.type ?? "submit", form: owner, root, document })));
       }
       return element;
     }
     // Replaces the page's locator with one whose selector resolves to `matches[selector]`, and records every fill.
     // Any element access on a selector without exactly one match is recorded in `fills.touched`.
-    function credentialFields(page: FakePage, matches: Record<string, FakeField[]>, hooks: FieldHooks = {}): Array<{ selector: string; value: string }> & { touched: number } {
-      const fills = Object.assign([] as Array<{ selector: string; value: string }>, { touched: 0 });
+    function credentialFields(page: FakePage, matches: Record<string, FakeField[]>, hooks: FieldHooks = {}): Array<{ selector: string; value: string }> & { touched: number; handlesDisposed: number } {
+      const fills = Object.assign([] as Array<{ selector: string; value: string }>, { touched: 0, handlesDisposed: 0 });
+      // Each field's fake DOM is built once, so its submit controls share it.
+      const built = new Map<FakeField, unknown>();
+      const elementOf = (field: FakeField): unknown => { if (!built.has(field)) built.set(field, fakeElement(field)); return built.get(field); };
       page.locator = (selector: string) => {
+        if (selector === "#submit") {
+          // The submit controls built for every matched field with a `submit` spec.
+          const controls = Object.values(matches).flat().filter((field) => field.submit).flatMap((field) => submitControls.get(elementOf(field) as object) ?? []);
+          return {
+            count: async () => controls.length,
+            evaluate: async (fn: Function, arg: unknown) => { if (controls.length !== 1) throw new Error("strict mode violation"); return fn(controls[0], arg); },
+          };
+        }
         const elements = matches[selector] ?? [];
         // As Playwright: several matches throw a strict-mode error; zero matches wait and time out.
         const single = (): FakeField => {
@@ -1101,7 +1136,14 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
         };
         return {
           count: hooks.count ?? (async () => elements.length),
-          evaluate: async (fn: Function) => { const element = fakeElement(single()); hooks.onEvaluate?.(); return fn(element); },
+          evaluate: async (fn: Function) => { const element = elementOf(single()); hooks.onEvaluate?.(); return fn(element); },
+          // As Playwright: the handle passed to evaluate arrives in the page as the element itself.
+          elementHandle: async (options: { timeout?: number }) => {
+            expect(options.timeout).toBe(2_000);
+            const element = elementOf(single()) as Record<string, unknown>;
+            element.dispose = async () => { fills.handlesDisposed++; };
+            return element;
+          },
           isVisible: async () => { const visible = single().visible ?? true; hooks.onVisible?.(); return visible; },
           fill: async (value: string, options: { timeout?: number }) => { single(); expect(options.timeout).toBe(2_000); hooks.onFill?.(); if (hooks.fillError) throw hooks.fillError; fills.push({ selector, value }); },
         };
@@ -1718,6 +1760,8 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
           ["no method attribute (the GET state)", {}],
           ["post form with a formmethod=get submitter", { method: "post", controls: [{ localName: "button", formmethod: "get" }] }],
           ["post form with an empty formmethod (the GET state)", { method: "post", controls: [{ localName: "button", formmethod: "" }] }],
+          ["post form whose <input type=image> submitter has formmethod=get (not in form.elements)", { method: "post", controls: [{ type: "image", formmethod: "get" }] }],
+          ["the same image submitter in a form inside a shadow root", { method: "post", shadow: true, controls: [{ type: "image", formmethod: "get" }] }],
           ["a method that cannot be read", { method: "post", prototypes: false }],
           ["an invalid method value (the GET state)", { method: "put" }],
           ["a method with surrounding space (invalid, so GET)", { method: " post" }],
@@ -1735,7 +1779,7 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
 
       test("POST, dialog and form-less inputs are allowed", async () => {
         const { bridge, page, tabId } = await leased();
-        for (const form of [{ method: "post" }, { method: "POST" }, { method: "dialog" }, { method: "post", controls: [{ localName: "button", formmethod: "post" }, { localName: "button", formmethod: "dialog" }] }, undefined] as Array<FakeForm | undefined>) {
+        for (const form of [{ method: "post" }, { method: "POST" }, { method: "dialog" }, { method: "post", controls: [{ localName: "button", formmethod: "post" }, { localName: "button", formmethod: "dialog" }] }, { method: "post", controls: [{ type: "image", formmethod: "post" }, { type: "image" }] }, { method: "post", shadow: true, controls: [{ type: "image", formmethod: "post" }] }, undefined] as Array<FakeForm | undefined>) {
           const fills = credentialFields(page, { "#password": [{ form }] });
           expect(await bridge.handle(request("allowed", "credential-type", credential(tabId)))).toEqual({ id: "allowed", ok: true, result: {} });
           expect(fills).toHaveLength(1);
@@ -1794,13 +1838,18 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
 
       test("totp goes only into a code-shaped field: one-time-code, a short numeric field, or a form with nothing else to type in", async () => {
         const { bridge, page, tabId } = await leased();
+        // The numeric rule applies only with a form owner; these forms also hold another text field.
+        const busyForm: FakeForm = { method: "post", controls: [{ type: "text" }] };
         const fits: FakeField[] = [
           { type: "text", autocomplete: "one-time-code" },
-          { type: "tel", autocomplete: null, inputMode: "numeric", maxLength: "6" },
-          { type: "number", autocomplete: null, inputMode: "numeric", maxLength: "10" },
+          { type: "tel", autocomplete: null, inputMode: "numeric", maxLength: "6", form: busyForm },
+          { type: "number", autocomplete: null, inputMode: "numeric", maxLength: "10", form: busyForm },
           { type: "text", autocomplete: null, form: { method: "post", controls: [{ type: "checkbox" }, { type: "hidden" }, { localName: "button" }] } },
         ];
         const refused: FakeField[] = [
+          // Form-less numeric fields: a form-less code field needs autocomplete=one-time-code.
+          { type: "tel", autocomplete: null, inputMode: "numeric", maxLength: "6" },
+          { type: "number", autocomplete: null, inputMode: "numeric", maxLength: "10" },
           { type: "text", autocomplete: null },
           { type: "text", autocomplete: null, inputMode: "numeric" },
           { type: "text", autocomplete: null, inputMode: "numeric", maxLength: "11" },
@@ -1820,6 +1869,55 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
           expect(await bridge.handle(request("refused", "credential-type", credential(tabId, { field: "totp", selector: "#field" }))), JSON.stringify(element)).toEqual({ id: "refused", ok: false, code: "permission-denied" });
           expect(fills).toEqual([]);
         }
+      });
+
+      test("a named submit control must be exactly one submit button of the filled input's own form", async () => {
+        const { bridge, page, tabId } = await leased(); const responses: BridgeResponse[] = [];
+        const loginForm: FakeForm = { method: "post", controls: [{ type: "password" }] };
+        const fits: FakeSubmit[] = [{ localName: "button", type: "submit" }, { localName: "input", type: "submit" }, { localName: "input", type: "image" }];
+        for (const submit of fits) {
+          const fills = credentialFields(page, { "#field": [{ type: "text", autocomplete: null, form: loginForm, submit }] });
+          const response = await bridge.handle(request("submit-ok", "credential-type", credential(tabId, { field: "username", selector: "#field", submit: "#submit" })));
+          responses.push(response);
+          expect(response, JSON.stringify(submit)).toEqual({ id: "submit-ok", ok: true, result: {} });
+          expect(fills).toHaveLength(1); expect(fills.handlesDisposed).toBe(1);
+        }
+        const refused: Array<[string, FakeField]> = [
+          ["no element matches", { type: "text", autocomplete: null, form: loginForm }],
+          ["two elements match", { type: "text", autocomplete: null, form: loginForm, submit: { count: 2 } }],
+          ["a type=button button", { type: "text", autocomplete: null, form: loginForm, submit: { type: "button" } }],
+          ["a type=reset button", { type: "text", autocomplete: null, form: loginForm, submit: { type: "reset" } }],
+          ["a text input", { type: "text", autocomplete: null, form: loginForm, submit: { localName: "input", type: "text" } }],
+          ["a link", { type: "text", autocomplete: null, form: loginForm, submit: { localName: "a", type: "" } }],
+          ["a submit button of another form", { type: "text", autocomplete: null, form: loginForm, submit: { form: "other" } }],
+          ["a form-less submit button", { type: "text", autocomplete: null, form: loginForm, submit: { form: "none" } }],
+          ["a form-less field with a form-less button", { type: "text", autocomplete: "username", submit: { form: "none" } }],
+          ["a button in another document", { type: "text", autocomplete: null, form: loginForm, submit: { otherDocument: true } }],
+        ];
+        for (const [label, element] of refused) {
+          const fills = credentialFields(page, { "#field": [element] }); page.credentialMarker = false;
+          const response = await bridge.handle(request("submit-bad", "credential-type", credential(tabId, { field: "username", selector: "#field", submit: "#submit" })));
+          responses.push(response);
+          expect(response, label).toEqual({ id: "submit-bad", ok: false, code: "permission-denied" });
+          expect(fills).toEqual([]); expect(page.credentialMarker).toBe(false);
+        }
+        // The submit selector is held to the field selector's rules, and must be a string.
+        for (const submit of ["form >> button", "internal:role=button", "", 7]) {
+          const fills = credentialFields(page, { "#field": [{ type: "text", autocomplete: null, form: loginForm, submit: {} }] });
+          expect(await bridge.handle(request("submit-shape", "credential-type", credential(tabId, { field: "username", selector: "#field", submit })))).toEqual({ id: "submit-shape", ok: false, code: "invalid-request" });
+          expect(fills).toEqual([]);
+        }
+        expect(JSON.stringify(responses)).not.toContain(CANARY);
+      });
+
+      test("the submit probe reads type and form owner through native prototype getters", () => {
+        const field = fakeElement({ type: "text", form: { method: "post" }, submit: {} }) as object;
+        const [button] = submitControls.get(field)!;
+        expect(probeSubmitControl(button, field)).toBe(true);
+        // The decoy own properties (type "password", form "decoy") are never read.
+        expect((button as Record<string, unknown>).type).toBe("password");
+        expect(probeSubmitControl(button, undefined)).toBe(false);
+        expect(probeSubmitControl({}, field)).toBe(false);
       });
 
       test("password still needs only an <input type=password>, outside a GET form", async () => {

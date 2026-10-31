@@ -105,12 +105,15 @@ bridge answers `invalid-request`.
 origin of that tab's main-frame URL. A tab whose origin is not one of the
 attachment's `origins` is `permission-denied`.
 
-`credential-type {tabId, field, selector, value, expectOrigin}` takes every
-argument, and returns exactly `{}` on success. `field` is `username`,
-`password` or `totp`; `value` is a 1 to 1024 character string with no NUL;
-`expectOrigin` is a canonical `https` origin (no path, trailing slash, userinfo
-or default port). Any other shape is `invalid-request`. The bridge then
-refuses, typing nothing:
+`credential-type {tabId, field, selector, value, expectOrigin, submit?}`
+requires every argument except `submit`, and returns exactly `{}` on
+success, with or without `submit`. `field` is `username`, `password` or
+`totp`; `value` is a 1 to 1024 character string with no NUL; `expectOrigin`
+is a canonical `https` origin (no path, trailing slash, userinfo or default
+port). `submit` names the control the daemon will press after the fill. The
+agent chose it, so it is not secret, and it is held to the same selector rules
+as `selector`. Any other shape is `invalid-request`. The bridge then refuses,
+typing nothing:
 
 - `permission-denied` unless the tab's main-frame origin equals `expectOrigin`
   and is in the attachment's `origins`.
@@ -134,15 +137,27 @@ refuses, typing nothing:
   - **`username`:** its form owner also has a password input, or it carries
     `autocomplete` `username` or `email`. A form-less input without that
     `autocomplete` is refused.
-  - **`totp`:** `autocomplete=one-time-code`, or `inputmode=numeric` with a
-    `maxlength` of 1 to 10, or a form owner with no other text-like control.
+  - **`totp`:** `autocomplete=one-time-code`; or, with a form owner,
+    `inputmode=numeric` with a `maxlength` of 1 to 10, or no other text-like
+    control in the form. A form-less code field needs
+    `autocomplete=one-time-code`.
 - `permission-denied` for every field when the input's form would submit by
   GET, which would put the value in the next URL. That covers a form whose
   method is `get`, missing or invalid (all of these are the GET state), and a
   `post` form with any associated control whose `formmethod` is not `post` or
-  `dialog`. Inputs outside any form, and `post` or `dialog` forms, are
+  `dialog`. That includes an `<input type=image>` submitter, which
+  `form.elements` leaves out: the bridge also walks the inputs of the form's
+  own tree (its document or shadow root) for image inputs whose form owner is
+  that form. Inputs outside any form, and `post` or `dialog` forms, are
   allowed. A single-page login form that omits `method` and submits by script
   is refused too; give it `method="post"`.
+- with `submit`, `permission-denied` unless `page.locator(submit)` matches
+  exactly one element, and it is a submit button (a `<button>` whose type is
+  `submit`, including a missing or invalid type, or an
+  `<input type=submit|image>`) in the same document whose form owner is the
+  filled input's form owner. A form-less input therefore cannot take a
+  `submit`. Type and form owner are read through the
+  `HTMLButtonElement`/`HTMLInputElement` prototype getters.
 - The probe reads every fact through the window's native prototypes:
   attributes via `Element.prototype.getAttribute`, type and form owner via
   `HTMLInputElement.prototype`, and the form's controls via

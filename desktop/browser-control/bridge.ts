@@ -148,6 +148,15 @@ export function probeCredentialField(element: any): CredentialFieldFacts {
         if (type === "password") facts.formHasPassword = true;
         if (["text", "email", "tel", "number", "password", "search", "url"].includes(type)) others++;
       }
+      // form.elements leaves out <input type=image>, which can still be the
+      // form's submitter (and its default button). Walk the inputs of the
+      // form's own tree (its document or shadow root) for those.
+      const root = view.Node.prototype.getRootNode.call(form);
+      const query = root === doc ? view.Document.prototype.querySelectorAll : view.DocumentFragment.prototype.querySelectorAll;
+      for (const candidate of Array.from(query.call(root, "input")) as any[]) {
+        if (getter(view.HTMLInputElement.prototype, "form").call(candidate) !== form || String(inputType.call(candidate)).toLowerCase() !== "image") continue;
+        if (view.Element.prototype.hasAttribute.call(candidate, "formmethod") && method(attribute(candidate, "formmethod")) === "get") formMethod = "get";
+      }
       facts.formMethod = formMethod;
       facts.otherTextFields = others;
     }
@@ -157,14 +166,41 @@ export function probeCredentialField(element: any): CredentialFieldFacts {
   } catch { facts.disabled = true; facts.readOnly = true; facts.formMethod = "unknown"; }
   return facts;
 }
+// The optional `submit` control credential-type verifies before a fill: a
+// submit button (<button> whose type is submit, including a missing or invalid
+// type, or <input type=submit|image>) in the same document whose form owner is
+// the filled input's form owner. Read through native prototype getters;
+// serialized into the page by locator.evaluate with the field's handle, so it
+// closes over nothing. Anything unreadable is false.
+export function probeSubmitControl(control: any, field: any): boolean {
+  try {
+    const view = control.ownerDocument.defaultView;
+    const getter = (prototype: any, name: string): Function => Object.getOwnPropertyDescriptor(prototype, name)!.get!;
+    const ownerDocument = getter(view.Node.prototype, "ownerDocument");
+    if (ownerDocument.call(field) !== ownerDocument.call(control)) return false;
+    if (getter(view.Element.prototype, "namespaceURI").call(control) !== "http://www.w3.org/1999/xhtml") return false;
+    const localName = getter(view.Element.prototype, "localName").call(control);
+    let form: unknown;
+    if (localName === "button") {
+      if (String(getter(view.HTMLButtonElement.prototype, "type").call(control)).toLowerCase() !== "submit") return false;
+      form = getter(view.HTMLButtonElement.prototype, "form").call(control);
+    } else if (localName === "input") {
+      const type = String(getter(view.HTMLInputElement.prototype, "type").call(control)).toLowerCase();
+      if (type !== "submit" && type !== "image") return false;
+      form = getter(view.HTMLInputElement.prototype, "form").call(control);
+    } else return false;
+    return form !== null && form === getter(view.HTMLInputElement.prototype, "form").call(field);
+  } catch { return false; }
+}
 // Whether the probed input is a place a credential of this kind belongs. The
 // agent picks the selector, so this refuses a field that merely fits the type:
 // a search box, or a "project name" field that would store the value.
 // - password: an <input type=password>.
 // - username: its form owner also has a password input, or it carries
 //   autocomplete username or email.
-// - totp: autocomplete one-time-code, or inputmode=numeric with a maxlength of
-//   1 to 10, or a form owner with no other text-like control.
+// - totp: autocomplete one-time-code, or (with a form owner) inputmode=numeric
+//   with a maxlength of 1 to 10, or a form owner with no other text-like
+//   control. A form-less TOTP field needs autocomplete=one-time-code.
 // Every field: connected, visible, enabled, not readonly, in the top document,
 // of a fitting type, and never in a form that submits by GET.
 export function credentialTargetFits(field: CredentialField, facts: CredentialFieldFacts): boolean {
@@ -173,7 +209,7 @@ export function credentialTargetFits(field: CredentialField, facts: CredentialFi
   if (field === "password") return true;
   if (field === "username") return (facts.formMethod !== "none" && facts.formHasPassword) || facts.autocomplete.includes("username") || facts.autocomplete.includes("email");
   return facts.autocomplete.includes("one-time-code")
-    || (facts.inputMode === "numeric" && facts.maxLength >= 1 && facts.maxLength <= MAX_TOTP_LENGTH)
+    || (facts.formMethod !== "none" && facts.inputMode === "numeric" && facts.maxLength >= 1 && facts.maxLength <= MAX_TOTP_LENGTH)
     || (facts.formMethod !== "none" && facts.otherTextFields === 0);
 }
 const LAYOUT_KEYS = ["scrollWidth", "scrollHeight", "clientWidth", "clientHeight", "innerWidth", "innerHeight"] as const;
@@ -1160,11 +1196,14 @@ export class BrowserBridge {
   // error code ever carries it.
   private async credentialType(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const deadline = Date.now() + this.requestDeadlineMs;
-    only(args, ["tabId", "field", "selector", "value", "expectOrigin"]);
+    only(args, ["tabId", "field", "selector", "value", "expectOrigin", "submit"]);
     if (args.tabId === undefined) fail("invalid-request");
     const tabId = opaque(args.tabId);
     const field = this.credentialField(args.field);
     const selector = this.credentialSelector(args.selector);
+    // Optional and not secret: the control the daemon will press after the
+    // fill. Held to the field selector's rules, then verified below.
+    const submit = args.submit === undefined ? undefined : this.credentialSelector(args.submit);
     const value = string(args.value, MAX_CREDENTIAL_VALUE);
     const expectOrigin = this.httpsOrigin(args.expectOrigin);
     // Any main-frame navigation from the first origin check on voids it, even
@@ -1193,6 +1232,15 @@ export class BrowserBridge {
         // search box or a form that submits by GET (see credentialTargetFits).
         if (!credentialTargetFits(field, this.credentialFacts(await locator.evaluate(probeCredentialField)))) fail("permission-denied");
         if (await locator.isVisible() !== true) fail("permission-denied");
+        // A named submit control must be exactly one submit button of the
+        // filled input's own form, or nothing is typed.
+        if (submit !== undefined) {
+          const submitLocator = page.locator(submit);
+          if (await submitLocator.count() !== 1) fail("permission-denied");
+          const fieldHandle = await locator.elementHandle({ timeout: CREDENTIAL_MARKER_WAIT_MS });
+          try { if (await submitLocator.evaluate(probeSubmitControl, fieldHandle) !== true) fail("permission-denied"); }
+          finally { void Promise.resolve(fieldHandle?.dispose?.()).catch(() => undefined); }
+        }
         stillWanted();
         // Detach, shutdown and every later attach close the tab, in this
         // process or a later one, whether or not it navigated since.

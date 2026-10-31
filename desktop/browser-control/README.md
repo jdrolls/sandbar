@@ -124,6 +124,18 @@ refuses, typing nothing:
   (a missing, empty or unknown `type` is `text`); `totp` needs `text`, `tel` or
   `number`. The type check uses the property, not the attribute, so
   `type=" password "` (rendered as text) is refused for a password.
+- `permission-denied` for every field when the input's form would submit by
+  GET, which would put the value in the next URL (a search box, say). That
+  covers a form whose method is `get`, missing or invalid (all of these are the
+  GET state), and a `post` form with any associated submitter whose
+  `formmethod` is not `post` or `dialog`. The method is read through the
+  window's own `HTMLFormElement` prototype, so a control named `method` cannot
+  clobber the answer. An unreadable method counts as GET. Inputs outside any
+  form, and `post` or `dialog` forms, are allowed. A single-page login form
+  that omits `method` and submits by script is refused too; give it
+  `method="post"`.
+- `permission-denied` unless the seat Chromium's credential policy is in effect
+  (see below).
 
 Immediately before `locator.fill(value)` the bridge re-reads the page origin
 and checks that no main-frame navigation happened since the first check, even
@@ -133,26 +145,56 @@ fillable), and it starts only while at least that much of the request deadline
 remains, so a request already answered with `timeout` never types later. If
 the main frame navigates during the fill itself, the result is
 `verification-failed`, never `{}`: the broker should treat that value as
-possibly delivered elsewhere and rotate it.
+possibly delivered elsewhere and rotate it. `verification-failed` comes only
+from after the fill was sent. Every refusal before it (count, probe,
+visibility, type, GET form, policy, target id, marker write) is
+`permission-denied` or `invalid-request`, so it never raises a false "rotate
+it" alarm.
 
-A filled page never outlives its lease. Before the value moves, the bridge
-marks the page in memory and in its document, as a non-enumerable,
-non-configurable main-world window property (`__sandbarCredentialFill`). If
-the mark cannot be written, the fill is refused with `verification-failed` and
-nothing is typed. The document marker survives the bridge process dying, and a
-cross-document main-frame navigation (a real submit) removes it with the old
-document. A same-document navigation (`pushState`, a hash change) does not.
-On `detach` and on EOF `shutdown`, the bridge closes every page whose document
-still carries the marker, or that this process marked and that cannot answer
-the bounded marker read. Every `attach` first reads the marker in every page
-and closes each marked page before the new attachment can list, select or
-observe it. A page on one of the new lease's origins that cannot answer the
-read is closed too, because nothing can prove it is clean. If a page that must
-close cannot be closed, `attach` returns `verification-failed`. A page that
-navigated after the fill is left open and listed normally. A single-page login
-that submits without a cross-document navigation keeps its marker, so its tab
-is closed at release. Within the attachment that did the fill, the bridge does
-not fence the page; the daemon's lease fence covers that window.
+A filled tab never outlives its lease. Before the value moves, the bridge
+records the tab in memory and marks its document:
+- **In memory:** the Playwright Page together with the browser's target id.
+  The target id stays the same across CDP connections, unlike the Page
+  wrapper, so the tab is recognized after a reattach.
+- **In the document:** a non-enumerable, non-configurable main-world window
+  property (`__sandbarCredentialFill`).
+
+If either cannot be recorded, the fill is refused with `permission-denied` and
+nothing is typed. On `detach`, on EOF `shutdown`, and on every `attach` before
+the new attachment can list, select or observe anything, the bridge closes
+every tab this process filled, whether or not it navigated since. A real login
+submit's tab is closed at release too; the session lives on in its cookies.
+It also closes every page whose document still carries the marker, which
+covers a fill by a bridge process that died. The marker survives the process,
+but a cross-document navigation removes it, so after a restart a filled tab
+that had already navigated is not recognized. The GET-form refusal keeps a
+value out of such a tab's URL. A page that cannot answer the bounded checks is
+closed if this process filled it, or at `attach` if it is on one of the new
+lease's origins. If a page that must close cannot be closed, `attach` returns
+`verification-failed`. Within the attachment that did the fill, the bridge
+does not fence the tab; the daemon's lease fence covers that window.
+
+The seat Chromium must not keep a typed value in its profile. The image ships
+`/etc/chromium/policies/managed/sandbar.json`, the mandatory machine policy
+directory of the image's Debian Chromium (verified on 156 in
+`chrome://policy`):
+
+| Policy | Value | Why |
+|---|---|---|
+| `PasswordManagerEnabled` | `false` | No offer to save the password |
+| `PasswordLeakDetectionEnabled` | `false` | No leak-check upload of credentials |
+| `AutofillAddressEnabled` | `false` | Deprecated in M156 but still applied |
+| `AutofillCreditCardEnabled` | `false` | Deprecated in M156 but still applied |
+| `AutofillSettings` | `[{"url_pattern": "*", "blocked_types": ["all"]}]` | The M156 replacement for the two above; blocks all Autofill saving |
+
+Without this policy, Chromium 156 stores a submitted username in the profile's
+`Web Data` `autofill` table; with it, nothing is stored. `doctor` returns
+`credentialPolicy: true` only when every file in that directory parses, each
+key above is set to exactly that value, and no file contradicts it. It
+reports nothing else about the policy. `credential-type` checks the same
+before every fill. Session restore is a separate store: Chromium writes a
+tab's form state (never password fields) to `Default/Sessions/`, and none of
+these policies change that.
 
 No value is left in a selection buffer either. On X11, selecting a filled
 field publishes it as PRIMARY, and a cut (Shift+Delete) puts it in CLIPBOARD;

@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import { BrowserBridge, NodeAdapter, readCredentialMarker, redactAriaValues, writeCredentialMarker, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
+import { BrowserBridge, CHROMIUM_MANAGED_POLICY_DIR, CREDENTIAL_POLICY, NodeAdapter, credentialPolicyHolds, probeCredentialField, readCredentialMarker, readCredentialPolicy, redactAriaValues, writeCredentialMarker, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
 
 class FakePage {
   events = new Map<string, Function[]>();
@@ -25,6 +25,9 @@ class FakePage {
   markerReadError?: Error;
   markerWriteResult: unknown = true;
   closeFailures = 0;
+  // The browser's target id: stable for the tab, unlike this wrapper object.
+  targetId = `TARGET${Math.random().toString(16).slice(2, 14).toUpperCase()}`;
+  targetIdError?: Error;
   async close(): Promise<void> { if (this.closeFailures > 0) { this.closeFailures--; throw new Error("page.close: Protocol error"); } this.closed++; }
   // A cross-document navigation replaces the document, and with it the marker.
   async goto(url: string): Promise<void> { this.gotoUrls.push(url); this.urlValue = url; this.credentialMarker = false; }
@@ -60,6 +63,14 @@ class FakeContext {
   // As Playwright: a closed page leaves the context's page list.
   pages(): FakePage[] { return this.allPages.filter((page) => page.closed === 0); }
   serviceWorkers(): FakeWorker[] { return this.workers; }
+  cdpSessions = 0; detachedSessions = 0;
+  async newCDPSession(page: FakePage): Promise<{ send: (method: string) => Promise<unknown>; detach: () => Promise<void> }> {
+    this.cdpSessions++;
+    return {
+      send: async (method: string) => { expect(method).toBe("Target.getTargetInfo"); if (page.targetIdError) throw page.targetIdError; return { targetInfo: { targetId: page.targetId, type: "page" } }; },
+      detach: async () => { this.detachedSessions++; },
+    };
+  }
   async newPage(): Promise<FakePage> { const page = new FakePage("about:blank"); this.allPages.push(page); for (const listener of this.events.get("page") ?? []) listener(page); return page; }
   async route(pattern: string, handler: Function): Promise<void> { this.routes.push({ pattern, handler }); }
   async routeWebSocket(_pattern: string, handler: Function): Promise<void> { this.websocketRoutes.push(handler); }
@@ -98,6 +109,8 @@ class FakeAdapter implements BridgeAdapter {
   clearFailure?: Error;
   pendingClear?: Promise<void>;
   onClear?: () => void;
+  credentialPolicyValue: boolean | Error = true;
+  async credentialPolicy(): Promise<boolean> { if (this.credentialPolicyValue instanceof Error) throw this.credentialPolicyValue; return this.credentialPolicyValue; }
   async clearSelections(): Promise<void> {
     this.selectionClears.push({ observersInstalled: (this.browser.context.events.get("page") ?? []).length > 0 });
     this.onClear?.();
@@ -1021,12 +1034,25 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     const CANARY = "CANARY-s3cr3t-7f1e9b";
     const LEASE = ["https://example.test", "https://other.test"];
     // An element as probeCredentialField sees it; defaults are a fillable password input.
-    interface FakeField { localName?: string; type?: string; topDocument?: boolean; connected?: boolean; disabled?: boolean; readOnly?: boolean; visible?: boolean }
+    // `form` is the input's form owner (absent: none); `submitters` are the formmethod values of its associated buttons;
+    // `prototypes: false` removes the window's HTMLFormElement, as a page that broke it would.
+    interface FakeForm { method: string; submitters?: string[]; prototypes?: false }
+    interface FakeField { localName?: string; type?: string; topDocument?: boolean; connected?: boolean; disabled?: boolean; readOnly?: boolean; visible?: boolean; form?: FakeForm }
     interface FieldHooks { onEvaluate?: () => void; onVisible?: () => void; onFill?: () => void; count?: () => Promise<number>; fillError?: Error }
+    function probeCredentialFieldOf(field: FakeField) { return probeCredentialField(fakeElement(field)); }
     function fakeElement(field: FakeField): unknown {
       const doc: Record<string, unknown> = {}; const view: Record<string, unknown> = { document: doc };
       view.top = field.topDocument === false ? {} : view; doc.defaultView = view;
-      return { namespaceURI: "http://www.w3.org/1999/xhtml", localName: field.localName ?? "input", type: field.type ?? "password", isConnected: field.connected ?? true, readOnly: field.readOnly ?? false, ownerDocument: doc, matches: (query: string) => query === ":disabled" && (field.disabled ?? false), hasAttribute: () => false };
+      let form: Record<string, unknown> | null = null;
+      if (field.form) {
+        // A control named "method" clobbers form.method; the probe must read through the prototype.
+        form = { methodValue: field.form.method, method: { localName: "input" } };
+        const owner = form;
+        if (field.form.prototypes !== false) view.HTMLFormElement = { prototype: Object.defineProperty({}, "method", { get(this: { methodValue: string }) { return this.methodValue; } }) };
+        doc.submitters = (field.form.submitters ?? []).map((formMethod) => ({ form: owner, formMethod }));
+      }
+      view.Document = { prototype: { querySelectorAll(this: { submitters?: unknown[] }, query: string) { expect(query).toBe("[formmethod]"); return this.submitters ?? []; } } };
+      return { form, namespaceURI: "http://www.w3.org/1999/xhtml", localName: field.localName ?? "input", type: field.type ?? "password", isConnected: field.connected ?? true, readOnly: field.readOnly ?? false, ownerDocument: doc, matches: (query: string) => query === ":disabled" && (field.disabled ?? false), hasAttribute: () => false };
     }
     // Replaces the page's locator with one whose selector resolves to `matches[selector]`, and records every fill.
     // Any element access on a selector without exactly one match is recorded in `fills.touched`.
@@ -1231,27 +1257,45 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
       function expectNoCanary(responses: BridgeResponse[]): void { expect(responses.length).toBeGreaterThan(0); expect(JSON.stringify(responses)).not.toContain(CANARY); }
 
       test("the fill marks the page in memory and in its document, before the value moves", async () => {
-        const { bridge, page, tabId } = await leased();
+        const { adapter, bridge, page, tabId } = await leased();
         let markedAtFill: boolean | undefined;
         credentialFields(page, { "#password": [{}] }, { onFill: () => { markedAtFill = page.credentialMarker; } });
         expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toEqual({ id: "fill", ok: true, result: {} });
         expect(markedAtFill).toBe(true);
-        expect((bridge as any).credentialPages.has(page)).toBe(true);
+        expect((bridge as any).filledPages.get(page)).toBe(page.targetId);
+        expect((bridge as any).filledTargets.has(page.targetId)).toBe(true);
+        expect(adapter.browser.context.cdpSessions).toBeGreaterThan(0); expect(adapter.browser.context.detachedSessions).toBe(adapter.browser.context.cdpSessions);
       });
 
-      test("a mark that cannot be written refuses the fill", async () => {
+      test("a mark that cannot be written refuses the fill as permission-denied, leaving nothing recorded", async () => {
         const { bridge, page, tabId } = await leased();
         for (const result of [false, undefined, "yes"]) {
           page.markerWriteResult = result;
           const fills = credentialFields(page, { "#password": [{}] });
-          expect(await bridge.handle(request("unmarked", "credential-type", credential(tabId)))).toEqual({ id: "unmarked", ok: false, code: "verification-failed" });
+          expect(await bridge.handle(request("unmarked", "credential-type", credential(tabId)))).toEqual({ id: "unmarked", ok: false, code: "permission-denied" });
           expect(fills).toEqual([]);
         }
         page.markerWriteResult = true;
+        const evaluate = page.evaluate.bind(page);
         page.evaluate = async () => { throw new TypeError("Cannot redefine property: __sandbarCredentialFill"); };
         const fills = credentialFields(page, { "#password": [{}] });
-        expect(await bridge.handle(request("redefined", "credential-type", credential(tabId)))).toEqual({ id: "redefined", ok: false, code: "verification-failed" });
+        expect(await bridge.handle(request("redefined", "credential-type", credential(tabId)))).toEqual({ id: "redefined", ok: false, code: "permission-denied" });
         expect(fills).toEqual([]);
+        expect((bridge as any).filledPages.size).toBe(0); expect((bridge as any).filledTargets.size).toBe(0);
+        // A failed mark after an earlier successful fill keeps that fill's record.
+        page.evaluate = evaluate;
+        expect(await bridge.handle(request("filled", "credential-type", credential(tabId)))).toMatchObject({ ok: true });
+        page.markerWriteResult = false;
+        expect(await bridge.handle(request("unmarked-again", "credential-type", credential(tabId)))).toMatchObject({ ok: false, code: "permission-denied" });
+        expect((bridge as any).filledTargets.has(page.targetId)).toBe(true);
+      });
+
+      test("a tab whose target id cannot be read is refused as permission-denied with nothing typed", async () => {
+        const { bridge, page, tabId } = await leased();
+        page.targetIdError = new Error("Protocol error (Target.getTargetInfo): No target with given id found");
+        const fills = credentialFields(page, { "#password": [{}] });
+        expect(await bridge.handle(request("no-target", "credential-type", credential(tabId)))).toEqual({ id: "no-target", ok: false, code: "permission-denied" });
+        expect(fills).toEqual([]); expect(page.credentialMarker).toBe(false);
       });
 
       test("detach closes an unsubmitted filled page", async () => {
@@ -1277,7 +1321,8 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
         expect(await send("tabs", "tabs", {})).toEqual({ id: "tabs", ok: true, result: { tabs: [] } });
         expect(await send("shot", "screenshot", { tabId })).toMatchObject({ ok: false, code: "invalid-request" });
         expect(page.events.get("console") ?? []).toEqual([]);
-        expect(adapter.browser.context.pages()).toEqual([]);
+        // Only the blank tab that keeps the seat browser alive remains.
+        expect(adapter.browser.context.pages().map((open) => open.url())).toEqual(["about:blank"]);
         expectNoCanary(responses);
       });
 
@@ -1297,17 +1342,89 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
         expectNoCanary([...responses, ...after.responses]);
       });
 
-      test("a page whose main frame navigated after the fill (a real submit) survives release and is listed again", async () => {
+      test("a filled tab that navigated since (a results page can echo the value) is still closed at release", async () => {
         const { bridge, page, tabId } = await leased(); const { responses, send } = recorder(bridge);
         credentialFields(page, { "#password": [{}] });
         expect(await send("fill", "credential-type", credential(tabId))).toMatchObject({ ok: true });
-        page.navigate("https://example.test/welcome");
+        page.navigate(`https://example.test/search?q=${CANARY}`);
+        expect(page.credentialMarker).toBe(false);
+        expect(await send("release", "detach", {})).toMatchObject({ ok: true });
+        expect(page.closed).toBe(1);
+        expect(await observerAttach(bridge)).toMatchObject({ ok: true, result: { pageCount: 0 } });
+        expect(await send("tabs", "tabs", {})).toEqual({ id: "tabs", ok: true, result: { tabs: [] } });
+        expect((bridge as any).filledTargets.size).toBe(0);
+        expectNoCanary(responses);
+      });
+
+      test("after a reattach, whose Page wrappers are new, a filled tab that navigated is recognized by target id and closed", async () => {
+        const { adapter, bridge, page, tabId } = await leased(); const { responses, send } = recorder(bridge);
+        credentialFields(page, { "#password": [{}] });
+        expect(await send("fill", "credential-type", credential(tabId))).toMatchObject({ ok: true });
+        page.closeFailures = 1;
         expect(await send("release", "detach", {})).toMatchObject({ ok: true });
         expect(page.closed).toBe(0);
+        // The next CDP connection sees the same tab, navigated (no marker), through a new wrapper.
+        const sameTab = new FakePage(`https://example.test/search?q=${CANARY}`); sameTab.targetId = page.targetId;
+        const other = new FakePage("https://example.test/news");
+        adapter.browser.context.allPages = [sameTab, other];
         expect(await observerAttach(bridge)).toMatchObject({ ok: true, result: { pageCount: 1 } });
-        expect(await send("tabs", "tabs", {})).toEqual({ id: "tabs", ok: true, result: { tabs: [{ tabId, selected: false }] } });
-        expect((bridge as any).credentialPages.has(page)).toBe(false);
+        expect(sameTab.closed).toBe(1); expect(other.closed).toBe(0);
+        const tabs = await send("tabs", "tabs", {});
+        expect((tabs.result as { tabs: unknown[] }).tabs).toHaveLength(1);
+        expect((bridge as any).filledTargets.size).toBe(0); expect((bridge as any).filledPages.size).toBe(0);
         expectNoCanary(responses);
+      });
+
+      test("a fresh process recognizes a filled tab only by its document marker", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        credentialFields(page, { "#password": [{}] });
+        expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toMatchObject({ ok: true });
+        // Navigated before the process died: the marker went with the document, and memory with the process.
+        // The GET-form refusal keeps a value out of such a page's URL.
+        page.navigate("https://example.test/account");
+        expect(await observerAttach(new BrowserBridge(adapter))).toMatchObject({ ok: true, result: { pageCount: 1 } });
+        expect(page.closed).toBe(0);
+      });
+
+      test("closing the seat's last tab opens a blank tab first, so the headed browser does not quit", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        const order: string[] = []; const context = adapter.browser.context; const newPage = context.newPage.bind(context);
+        context.newPage = async () => { order.push("new"); return newPage(); };
+        const close = page.close.bind(page); page.close = async () => { order.push("close"); return close(); };
+        credentialFields(page, { "#password": [{}] });
+        expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toMatchObject({ ok: true });
+        expect(await bridge.handle(request("release", "detach", {}))).toMatchObject({ ok: true });
+        expect(order).toEqual(["new", "close"]);
+        expect(context.pages().map((open) => open.url())).toEqual(["about:blank"]);
+        // With another tab still open, no blank tab is added.
+        const second = await leased(); const other = new FakePage("https://example.test/news"); second.adapter.browser.context.allPages.push(other);
+        const before = second.adapter.browser.context.allPages.length;
+        credentialFields(second.page, { "#password": [{}] });
+        expect(await second.bridge.handle(request("fill", "credential-type", credential(second.tabId)))).toMatchObject({ ok: true });
+        expect(await second.bridge.handle(request("release", "detach", {}))).toMatchObject({ ok: true });
+        expect(second.adapter.browser.context.allPages.length).toBe(before);
+        expect(second.adapter.browser.context.pages()).toEqual([other]);
+        // A blank tab that cannot be opened does not stop the credential tab from closing.
+        const third = await leased(); third.adapter.browser.context.newPage = async () => { throw new Error("browser busy"); };
+        credentialFields(third.page, { "#password": [{}] });
+        expect(await third.bridge.handle(request("fill", "credential-type", credential(third.tabId)))).toMatchObject({ ok: true });
+        expect(await third.bridge.handle(request("release", "detach", {}))).toMatchObject({ ok: true });
+        expect(third.page.closed).toBe(1);
+      });
+
+      test("a tracked tab that was closed elsewhere is forgotten once every open tab names its target", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        credentialFields(page, { "#password": [{}] });
+        expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toMatchObject({ ok: true });
+        await page.close(); // the human closed the tab
+        const remaining = new FakePage("https://example.test/news"); adapter.browser.context.allPages.push(remaining);
+        remaining.targetIdError = new Error("Target closed");
+        expect(await bridge.handle(request("release", "detach", {}))).toMatchObject({ ok: true });
+        // One open tab could not name its target, so the record is kept.
+        expect((bridge as any).filledTargets.has(page.targetId)).toBe(true);
+        remaining.targetIdError = undefined;
+        expect(await observerAttach(bridge)).toMatchObject({ ok: true });
+        expect((bridge as any).filledTargets.size).toBe(0); expect(remaining.closed).toBe(0);
       });
 
       test("a same-document navigation keeps the filled document, so the page still closes", async () => {
@@ -1459,6 +1576,126 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
           expect(failure?.message).toBe("selection not empty after clear");
           expect(String(failure)).not.toContain(CANARY);
         } finally { exec.mockRestore(); }
+      });
+    });
+
+    describe("GET forms and pre-dispatch refusals", () => {
+      test("a field in a form that submits by GET is refused for every field, with nothing typed, marked or cleared", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        const getForms: Array<[string, FakeForm]> = [
+          ["explicit or default method get", { method: "get" }],
+          ["post form with a formmethod=get submitter", { method: "post", submitters: ["get"] }],
+          ["post form with an empty or invalid formmethod (the GET state)", { method: "post", submitters: [""] }],
+          ["a method that cannot be read", { method: "post", prototypes: false }],
+          ["an unknown method value", { method: "put" }],
+        ];
+        for (const [label, form] of getForms) {
+          for (const [field, type] of [["username", "text"], ["password", "password"], ["totp", "tel"]]) {
+            const fills = credentialFields(page, { "#field": [{ type, form }] }); adapter.selectionClears = [];
+            const response = await bridge.handle(request("get-form", "credential-type", credential(tabId, { field, selector: "#field" })));
+            expect(response, label).toEqual({ id: "get-form", ok: false, code: "permission-denied" });
+            expect(fills).toEqual([]); expect(page.credentialMarker).toBe(false); expect(adapter.selectionClears).toEqual([]);
+            expect((bridge as any).filledTargets.size).toBe(0);
+          }
+        }
+      });
+
+      test("POST, dialog and form-less inputs are allowed", async () => {
+        const { bridge, page, tabId } = await leased();
+        for (const form of [{ method: "post" }, { method: "dialog" }, { method: "post", submitters: ["post", "dialog"] }, undefined] as Array<FakeForm | undefined>) {
+          const fills = credentialFields(page, { "#password": [{ form }] });
+          expect(await bridge.handle(request("allowed", "credential-type", credential(tabId)))).toEqual({ id: "allowed", ok: true, result: {} });
+          expect(fills).toHaveLength(1);
+        }
+      });
+
+      test("the probe reads the form method through the prototype, so a control named method cannot clobber it", () => {
+        const facts = probeCredentialFieldOf({ type: "password", form: { method: "get" } });
+        expect(facts.formMethod).toBe("get");
+        // A direct form.method read would see the clobbering control, not "post".
+        expect(probeCredentialFieldOf({ type: "password", form: { method: "post" } }).formMethod).toBe("post");
+        expect(probeCredentialFieldOf({ type: "password" }).formMethod).toBe("none");
+      });
+
+      test("no failure before the fill is dispatched is verification-failed", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        const codes: string[] = [];
+        const attempt = async (setup: () => void, args: Record<string, unknown> = {}) => { setup(); const response = await bridge.handle(request("pre", "credential-type", credential(tabId, args))); expect(response.ok).toBe(false); codes.push(response.code!); };
+        await attempt(() => credentialFields(page, { "#password": [] }));
+        await attempt(() => credentialFields(page, { "#password": [{}, {}] }));
+        await attempt(() => credentialFields(page, { "#password": [{ type: "text" }] }));
+        await attempt(() => credentialFields(page, { "#password": [{ visible: false }] }));
+        await attempt(() => credentialFields(page, { "#password": [{ form: { method: "get" } }] }));
+        await attempt(() => { credentialFields(page, { "#password": [{}] }); page.markerWriteResult = false; });
+        await attempt(() => { page.markerWriteResult = true; page.targetIdError = new Error("gone"); credentialFields(page, { "#password": [{}] }); });
+        await attempt(() => { page.targetIdError = undefined; adapter.credentialPolicyValue = false; credentialFields(page, { "#password": [{}] }); });
+        // A probe answer of the wrong shape.
+        await attempt(() => { adapter.credentialPolicyValue = true; credentialFields(page, { "#password": [{}] }); const locator = page.locator; page.locator = (selector: string) => ({ ...locator(selector), evaluate: async () => ({ input: true, type: "password" }) }); });
+        expect(codes).toHaveLength(9);
+        for (const code of codes) expect(["permission-denied", "invalid-request"]).toContain(code);
+        expect(adapter.selectionClears.length).toBe(1); // only the attach
+      });
+    });
+
+    describe("seat Chromium credential policy", () => {
+      test("doctor attests the policy with one boolean and nothing else about it", async () => {
+        configured(); const adapter = new FakeAdapter(); const bridge = new BrowserBridge(adapter);
+        expect(await bridge.handle(request("doctor", "doctor", {}))).toMatchObject({ ok: true, result: { credentialPolicy: true } });
+        for (const value of [false, new Error("EACCES /etc/chromium/policies/managed")]) {
+          adapter.credentialPolicyValue = value;
+          const doctor = await bridge.handle(request("doctor", "doctor", {}));
+          expect(doctor).toMatchObject({ ok: true, result: { credentialPolicy: false } });
+          expect(JSON.stringify(doctor)).not.toContain("policies");
+        }
+      });
+
+      test("credential-type refuses, typing nothing, while the policy is not in effect", async () => {
+        const { adapter, bridge, page, tabId } = await leased();
+        for (const value of [false, new Error("unreadable")]) {
+          adapter.credentialPolicyValue = value;
+          const fills = credentialFields(page, { "#password": [{}] });
+          expect(await bridge.handle(request("no-policy", "credential-type", credential(tabId)))).toEqual({ id: "no-policy", ok: false, code: "permission-denied" });
+          expect(fills).toEqual([]); expect(page.credentialMarker).toBe(false);
+        }
+      });
+
+      test("the image's policy file is exactly the required policy, at the path Chromium reads", async () => {
+        expect(CHROMIUM_MANAGED_POLICY_DIR).toBe("/etc/chromium/policies/managed");
+        const shipped = join(import.meta.dir, "../root/etc/chromium/policies/managed/sandbar.json");
+        const document = JSON.parse(await fs.readFile(shipped, "utf8"));
+        expect(document).toEqual(CREDENTIAL_POLICY);
+        expect(credentialPolicyHolds([document])).toBe(true);
+        expect(await readCredentialPolicy(dirname(shipped))).toBe(true);
+      });
+
+      test("the policy holds only when every key is set as required and no file contradicts it", () => {
+        expect(credentialPolicyHolds([CREDENTIAL_POLICY])).toBe(true);
+        expect(credentialPolicyHolds([{ ...CREDENTIAL_POLICY }, { HomepageLocation: "https://example.test" }])).toBe(true);
+        expect(credentialPolicyHolds([])).toBe(false);
+        for (const key of Object.keys(CREDENTIAL_POLICY)) {
+          const { [key]: _dropped, ...partial } = CREDENTIAL_POLICY as Record<string, unknown>;
+          expect(credentialPolicyHolds([partial])).toBe(false);
+          expect(credentialPolicyHolds([CREDENTIAL_POLICY, { [key]: true }])).toBe(false);
+        }
+        expect(credentialPolicyHolds([{ ...CREDENTIAL_POLICY, AutofillSettings: [{ url_pattern: "*", blocked_types: ["payments"] }] }])).toBe(false);
+        for (const bad of [null, [], "x", 1]) expect(credentialPolicyHolds([CREDENTIAL_POLICY, bad])).toBe(false);
+      });
+
+      test("reading the policy directory fails closed on a missing directory, broken JSON or an oversized file, and follows symlinks", async () => {
+        const root = await fs.mkdtemp(join(tmpdir(), "sandbar-policy-"));
+        try {
+          expect(await readCredentialPolicy(join(root, "absent"))).toBe(false);
+          const valid = join(root, "valid"); await fs.mkdir(valid); await fs.writeFile(join(valid, "sandbar.json"), JSON.stringify(CREDENTIAL_POLICY));
+          expect(await readCredentialPolicy(valid)).toBe(true);
+          const broken = join(root, "broken"); await fs.mkdir(broken); await fs.writeFile(join(broken, "sandbar.json"), JSON.stringify(CREDENTIAL_POLICY)); await fs.writeFile(join(broken, "other.json"), "{ not json");
+          expect(await readCredentialPolicy(broken)).toBe(false);
+          const large = join(root, "large"); await fs.mkdir(large); await fs.writeFile(join(large, "sandbar.json"), JSON.stringify({ ...CREDENTIAL_POLICY, Padding: "x".repeat(70 * 1024) }));
+          expect(await readCredentialPolicy(large)).toBe(false);
+          const linked = join(root, "linked"); await fs.mkdir(linked); await fs.symlink(join(valid, "sandbar.json"), join(linked, "sandbar.json"));
+          expect(await readCredentialPolicy(linked)).toBe(true);
+          const contradicted = join(root, "contradicted"); await fs.mkdir(contradicted); await fs.writeFile(join(contradicted, "a.json"), JSON.stringify(CREDENTIAL_POLICY)); await fs.writeFile(join(contradicted, "b.json"), JSON.stringify({ PasswordManagerEnabled: true }));
+          expect(await readCredentialPolicy(contradicted)).toBe(false);
+        } finally { await fs.rm(root, { recursive: true, force: true }); }
       });
     });
 

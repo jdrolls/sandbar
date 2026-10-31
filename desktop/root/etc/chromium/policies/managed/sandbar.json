@@ -1,0 +1,7 @@
+{
+  "PasswordManagerEnabled": false,
+  "PasswordLeakDetectionEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "AutofillSettings": [{ "url_pattern": "*", "blocked_types": ["all"] }]
+}

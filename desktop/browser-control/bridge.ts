@@ -76,13 +76,35 @@ export function writeCredentialMarker(key: string): boolean {
 }
 // Any own property under the key counts as marked: a page can only fail closed.
 export function readCredentialMarker(key: string): boolean { return Object.getOwnPropertyDescriptor(globalThis, key) !== undefined; }
-export interface CredentialFieldFacts { input: boolean; type: string; topDocument: boolean; connected: boolean; disabled: boolean; readOnly: boolean }
+// formMethod is "none" (no form owner), the form's effective method, or "get"
+// when any associated submitter overrides it with formmethod=get. It reads
+// through the window's own prototypes, so a control named "method" or
+// "elements" cannot clobber the answer; anything unreadable is "unknown".
+export interface CredentialFieldFacts { input: boolean; type: string; topDocument: boolean; connected: boolean; disabled: boolean; readOnly: boolean; formMethod: string }
+// Only these form methods may receive a credential: a GET submission puts the
+// field's value in the URL, so the next document (and history) echoes it.
+const CREDENTIAL_FORM_METHODS: ReadonlySet<string> = new Set(["none", "post", "dialog"]);
 // Serialized into the page by locator.evaluate, so it closes over nothing and
 // reads only the element and its own document and window.
 export function probeCredentialField(element: any): CredentialFieldFacts {
   const doc = element?.ownerDocument;
   const view = doc?.defaultView;
+  let formMethod = "unknown";
+  try {
+    const form = element?.form;
+    if (form === null) formMethod = "none";
+    else if (form) {
+      const methodOf = Object.getOwnPropertyDescriptor(view.HTMLFormElement.prototype, "method")?.get;
+      formMethod = String(methodOf.call(form)).toLowerCase();
+      // Every submitter of this form, inside it or linked by a form= attribute.
+      const submitters: any[] = Array.from(view.Document.prototype.querySelectorAll.call(doc, "[formmethod]"));
+      for (const submitter of submitters) {
+        if (submitter.form === form && String(submitter.formMethod).toLowerCase() !== "post" && String(submitter.formMethod).toLowerCase() !== "dialog") formMethod = "get";
+      }
+    }
+  } catch { formMethod = "unknown"; }
   return {
+    formMethod,
     input: element?.namespaceURI === "http://www.w3.org/1999/xhtml" && element?.localName === "input",
     type: String(element?.type ?? "").toLowerCase(),
     topDocument: Boolean(view) && view.top === view && view.document === doc,
@@ -142,6 +164,57 @@ export interface BridgeAdapter {
   // Empties the seat display's CLIPBOARD and PRIMARY selections and confirms
   // both read back empty; rejects otherwise. Never returns selection contents.
   clearSelections(): Promise<void>;
+  // True only when the seat Chromium's managed policy (CREDENTIAL_POLICY)
+  // is installed as required; it never returns policy contents.
+  credentialPolicy(): Promise<boolean>;
+}
+
+// The directory Debian's Chromium (the seat's browser) reads mandatory
+// machine policy from; verified against Chromium 156 via chrome://policy.
+export const CHROMIUM_MANAGED_POLICY_DIR = "/etc/chromium/policies/managed";
+// The image ships these in desktop/root/etc/chromium/policies/managed/sandbar.json.
+// No password manager, leak check upload, address/card autofill, or (via
+// AutofillSettings "all", the M156 replacement for the two deprecated
+// booleans) any other Autofill saving, so a typed credential stays out of the
+// profile.
+export const CREDENTIAL_POLICY: Readonly<Record<string, unknown>> = {
+  PasswordManagerEnabled: false,
+  PasswordLeakDetectionEnabled: false,
+  AutofillAddressEnabled: false,
+  AutofillCreditCardEnabled: false,
+  AutofillSettings: [{ url_pattern: "*", blocked_types: ["all"] }],
+};
+const MAX_POLICY_FILES = 32;
+const MAX_POLICY_FILE_BYTES = 64 * 1024;
+// Chromium merges every file in the directory, so the policy holds only when
+// each required key is set to its value somewhere and no file sets it to
+// anything else. Any unreadable or non-object document fails closed.
+export function credentialPolicyHolds(documents: readonly unknown[]): boolean {
+  const records: Record<string, unknown>[] = [];
+  for (const document of documents) {
+    if (!document || typeof document !== "object" || Array.isArray(document)) return false;
+    records.push(document as Record<string, unknown>);
+  }
+  return Object.entries(CREDENTIAL_POLICY).every(([key, required]) => {
+    const values = records.filter((record) => Object.hasOwn(record, key)).map((record) => JSON.stringify(record[key]));
+    return values.length > 0 && values.every((value) => value === JSON.stringify(required));
+  });
+}
+export async function readCredentialPolicy(directory = CHROMIUM_MANAGED_POLICY_DIR): Promise<boolean> {
+  try {
+    const entries = await fs.readdir(directory);
+    if (entries.length > MAX_POLICY_FILES) return false;
+    const documents: unknown[] = [];
+    for (const entry of entries) {
+      // stat follows a symlinked policy file, as Chromium does.
+      const path = join(directory, entry);
+      const info = await fs.stat(path);
+      if (!info.isFile()) continue;
+      if (info.size > MAX_POLICY_FILE_BYTES) return false;
+      documents.push(JSON.parse(await fs.readFile(path, "utf8")));
+    }
+    return credentialPolicyHolds(documents);
+  } catch { return false; }
 }
 
 // Clears CLIPBOARD and PRIMARY with fixed xsel argv, then reads each back and
@@ -248,9 +321,12 @@ export class BrowserBridge {
   // window discovery is asynchronous, so ownership begins before an X11
   // window exists and ends only after explicit cleanup.
   private readonly launchedMousepads = new Map<number, LaunchedMousepad>();
-  // Pages this process marked before a credential fill. The document marker is
-  // authoritative; this is the fallback when a page cannot answer a marker read.
-  private readonly credentialPages = new WeakSet<object>();
+  // Every tab this process filled, closed at detach, shutdown and the next
+  // attach whether or not it navigated since. Page wrappers are per CDP
+  // connection, so each is kept with its browser target id, and the target ids
+  // outlive a reattach. The document marker covers a process that died.
+  private readonly filledPages = new Map<object, string>();
+  private readonly filledTargets = new Set<string>();
   private selectedTabId?: string;
   private dispatch: Promise<void> = Promise.resolve();
   private ending = false;
@@ -444,11 +520,12 @@ export class BrowserBridge {
       if (!origins.has(this.workerOrigin(worker))) { await this.closeConnection(browser).catch(() => undefined); fail("permission-denied"); }
     }
     if (workers.length > 0) { await this.closeConnection(browser).catch(() => undefined); fail("verification-failed"); }
-    // A page left holding an unsubmitted credential (by an earlier lease, or by
-    // a bridge process that died) is closed before this attachment can list,
-    // select or observe it. A leased-origin page that cannot answer is treated
-    // as marked; one that cannot be closed refuses the attach.
-    try { await this.closeCredentialPages(context.pages(), (page) => origins.has(this.pageOrigin(page) ?? "")); }
+    // A tab that received a credential (from an earlier lease of this process,
+    // navigated or not, or marked by a bridge process that died) is closed
+    // before this attachment can list, select or observe it. A leased-origin
+    // page that cannot answer is treated as marked; one that cannot be closed
+    // refuses the attach.
+    try { await this.closeCredentialPages(context, (page) => origins.has(this.pageOrigin(page) ?? "")); }
     catch { await this.closeConnection(browser).catch(() => undefined); fail("verification-failed"); }
     // An earlier lease may have cut or selected a value into the seat's X
     // selections. They must be empty before this attachment can paste;
@@ -639,7 +716,7 @@ export class BrowserBridge {
     this.nativeWindows.clear();
     // Best effort: a page that cannot be closed now keeps its document marker,
     // and the next attach closes it before anything can list it.
-    await this.bounded(this.closeCredentialPages(attached.context.pages(), () => false), "session-lost").catch(() => undefined);
+    await this.bounded(this.closeCredentialPages(attached.context, () => false), "session-lost").catch(() => undefined);
     // Best effort and bounded, like the page sweep; the next attach clears
     // again and refuses if it cannot.
     await this.clearSelections().catch(() => undefined);
@@ -664,7 +741,7 @@ export class BrowserBridge {
     // searches for or signals a desktop process by a caller-provided PID.
     await this.stopLaunchedMousepads().catch(() => undefined);
     // Bounded, then CDP closes regardless; a page left open keeps its marker.
-    if (attached) await this.bounded(this.closeCredentialPages(attached.context.pages(), () => false), "session-lost").catch(() => undefined);
+    if (attached) await this.bounded(this.closeCredentialPages(attached.context, () => false), "session-lost").catch(() => undefined);
     // Cleared even with no attachment: a failed clear at an earlier detach
     // must not leave a value for whatever this seat runs next.
     await this.clearSelections().catch(() => undefined);
@@ -678,29 +755,47 @@ export class BrowserBridge {
   // true: the page's document holds the marker; false: it provably does not;
   // undefined: the page could not answer in time (closed, crashed, wedged).
   private async credentialMarker(page: any): Promise<boolean | undefined> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const answer: unknown = await Promise.race([
-        Promise.resolve().then(() => page.evaluate(readCredentialMarker, CREDENTIAL_MARKER)),
-        new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), CREDENTIAL_MARKER_WAIT_MS); }),
-      ]);
-      return typeof answer === "boolean" ? answer : undefined;
-    } catch { return undefined; } finally { if (timer) clearTimeout(timer); }
+    const answer: unknown = await this.settleWithin(() => page.evaluate(readCredentialMarker, CREDENTIAL_MARKER), CREDENTIAL_MARKER_WAIT_MS);
+    return typeof answer === "boolean" ? answer : undefined;
   }
-  // Closes every page that may still hold an unsubmitted credential: its
-  // document carries the marker, or it cannot answer and either this process
-  // marked it or `closeUnanswerable` says so. A page whose marker is provably
-  // gone navigated away from the filled document and is left alone. Throws if
-  // any page that must close could not be closed.
-  private async closeCredentialPages(pages: any[], closeUnanswerable: (page: any) => boolean): Promise<void> {
-    const outcomes = await Promise.allSettled(pages.map(async (page) => {
+  // Closes every page that may still hold a credential this seat typed:
+  // - any tab this process filled, matched by Page wrapper or (after a
+  //   reattach, when wrappers are new) by browser target id, whether or not it
+  //   navigated since: a GET submit or a results page can echo the value;
+  // - any page whose document carries the marker (a fill by a process that died);
+  // - a page that cannot answer the marker read when `closeUnanswerable` says so.
+  // Throws if any page that must close could not be closed.
+  private async closeCredentialPages(context: any, closeUnanswerable: (page: any) => boolean): Promise<void> {
+    const pages: any[] = context.pages();
+    // A Page wrapper absent from the context is closed, or belongs to an
+    // earlier CDP connection; its tab stays tracked by target id.
+    for (const page of [...this.filledPages.keys()]) if (!pages.includes(page)) this.filledPages.delete(page);
+    const matchTargets = this.filledTargets.size > 0;
+    const verdicts = await Promise.all(pages.map(async (page): Promise<{ page: any; close: boolean; targetId: string | undefined }> => {
+      const targetId = this.filledPages.get(page) ?? (matchTargets ? await this.targetId(context, page) : undefined);
+      const filled = this.filledPages.has(page) || (targetId !== undefined && this.filledTargets.has(targetId));
+      if (filled) return { page, close: true, targetId };
       const marker = await this.credentialMarker(page);
-      if (marker === false) { this.credentialPages.delete(page); return; }
-      if (marker === undefined && !this.credentialPages.has(page) && !closeUnanswerable(page)) return;
+      return { page, close: marker === true || (marker === undefined && closeUnanswerable(page)), targetId };
+    }));
+    const closing = verdicts.filter((verdict) => verdict.close);
+    // A headed Chromium quits when its last window closes, which would take the
+    // shared seat down. Keep one blank tab open first; if that fails, the
+    // credential tabs still close.
+    if (closing.length > 0 && closing.length === pages.length) await this.settleWithin(() => context.newPage(), CREDENTIAL_MARKER_WAIT_MS);
+    const outcomes = await Promise.allSettled(closing.map(async ({ page, targetId }) => {
       await page.close({ runBeforeUnload: false });
-      this.credentialPages.delete(page);
+      this.filledPages.delete(page);
+      if (targetId !== undefined) this.filledTargets.delete(targetId);
     }));
     if (outcomes.some((outcome) => outcome.status === "rejected")) fail("verification-failed");
+    // Once every page left open has named its target, a tracked target that is
+    // not among them was closed elsewhere and can be forgotten.
+    const kept = verdicts.filter((verdict) => !verdict.close);
+    if (matchTargets && kept.every((verdict) => verdict.targetId !== undefined)) {
+      const live = new Set(kept.map((verdict) => verdict.targetId));
+      for (const targetId of [...this.filledTargets]) if (!live.has(targetId)) this.filledTargets.delete(targetId);
+    }
   }
 
   private async doctor(args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -715,7 +810,7 @@ export class BrowserBridge {
       const context = contexts[0];
       const browserId = this.adapterBrowserId(await this.adapter.browserIdentity());
       const version = truncate(String(await browser.version()), 128);
-      return { browserVersion: version.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "[redacted]"), browserId, contextId: this.contextId(browserId), display: { width: number(display.width, 1, MAX_VIEWPORT.width), height: number(display.height, 1, MAX_VIEWPORT.height) }, attached: Boolean(attached), pageCount: context.pages().length };
+      return { browserVersion: version.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "[redacted]"), browserId, contextId: this.contextId(browserId), display: { width: number(display.width, 1, MAX_VIEWPORT.width), height: number(display.height, 1, MAX_VIEWPORT.height) }, attached: Boolean(attached), pageCount: context.pages().length, credentialPolicy: await this.credentialPolicyInEffect() };
     } finally { if (!attached) await this.closeConnection(browser); }
   }
 
@@ -836,12 +931,41 @@ export class BrowserBridge {
     if (url.protocol !== "https:" || url.origin !== raw) fail("invalid-request");
     return raw;
   }
+  // A probe answer that is not exactly this shape is a refusal: nothing has been
+  // typed yet, so it is permission-denied, never verification-failed.
   private credentialFacts(value: unknown): CredentialFieldFacts {
-    if (!value || typeof value !== "object" || Array.isArray(value)) fail("verification-failed");
+    if (!value || typeof value !== "object" || Array.isArray(value)) fail("permission-denied");
     const facts = value as Record<string, unknown>;
-    for (const key of ["input", "topDocument", "connected", "disabled", "readOnly"] as const) if (typeof facts[key] !== "boolean") fail("verification-failed");
-    if (typeof facts.type !== "string") fail("verification-failed");
-    return { input: facts.input as boolean, type: facts.type, topDocument: facts.topDocument as boolean, connected: facts.connected as boolean, disabled: facts.disabled as boolean, readOnly: facts.readOnly as boolean };
+    for (const key of ["input", "topDocument", "connected", "disabled", "readOnly"] as const) if (typeof facts[key] !== "boolean") fail("permission-denied");
+    if (typeof facts.type !== "string" || typeof facts.formMethod !== "string") fail("permission-denied");
+    return { input: facts.input as boolean, type: facts.type, topDocument: facts.topDocument as boolean, connected: facts.connected as boolean, disabled: facts.disabled as boolean, readOnly: facts.readOnly as boolean, formMethod: facts.formMethod };
+  }
+  // Resolves to undefined, never throws, when the work fails or outlasts `ms`.
+  private async settleWithin<T>(work: () => Promise<T>, ms: number): Promise<T | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(work),
+        new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), ms); }),
+      ]);
+    } catch { return undefined; } finally { if (timer) clearTimeout(timer); }
+  }
+  // The browser's own id for a tab. Unlike a Playwright Page wrapper, it is the
+  // same across CDP connections, so a filled tab is recognized after a reattach.
+  private async targetId(context: any, page: any): Promise<string | undefined> {
+    return this.settleWithin(async () => {
+      const session = await context.newCDPSession(page);
+      try {
+        const info: unknown = await session.send("Target.getTargetInfo");
+        const id = (info as { targetInfo?: { targetId?: unknown } } | undefined)?.targetInfo?.targetId;
+        return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id) ? id : undefined;
+      } finally { void Promise.resolve(session.detach?.()).catch(() => undefined); }
+    }, CREDENTIAL_MARKER_WAIT_MS);
+  }
+  // The managed Chromium policy that keeps typed credentials out of the
+  // profile; false on any failure to read it.
+  private async credentialPolicyInEffect(): Promise<boolean> {
+    return (await this.settleWithin(() => this.adapter.credentialPolicy(), CREDENTIAL_MARKER_WAIT_MS)) === true;
   }
   // The host daemon forwards this only from the credential broker's socket under
   // an active lease on the origin, so it needs no allowInput grant. The bridge is
@@ -860,6 +984,9 @@ export class BrowserBridge {
     const page = this.approvedPage(args.tabId);
     const onExpectedOrigin = (): boolean => this.attachment === attached && attached.origins.has(expectOrigin) && this.pageOrigin(page) === expectOrigin;
     if (!onExpectedOrigin()) fail("permission-denied");
+    // A browser that would save the typed value (password manager, form history)
+    // never receives one.
+    if (!(await this.credentialPolicyInEffect())) fail("permission-denied");
     // Any main-frame navigation from here on voids the origin check, even one
     // that lands back on the same origin: the checked document is gone.
     let navigated = false;
@@ -871,15 +998,26 @@ export class BrowserBridge {
       if (await locator.count() !== 1) fail("invalid-request");
       const facts = this.credentialFacts(await locator.evaluate(probeCredentialField));
       if (!facts.input || !facts.topDocument || !facts.connected || facts.disabled || facts.readOnly || !CREDENTIAL_INPUT_TYPES[field].has(facts.type)) fail("permission-denied");
+      // No real login form submits by GET, and a GET submit (a search box, say)
+      // carries the value into the next URL. Refused for every field.
+      if (!CREDENTIAL_FORM_METHODS.has(facts.formMethod)) fail("permission-denied");
       if (await locator.isVisible() !== true) fail("permission-denied");
-      // Mark the page before the value moves, so no page can hold the value
-      // unmarked: detach, shutdown and every later attach close a marked page
-      // whose filled document is still loaded. A mark that cannot be written
-      // refuses the fill.
-      this.credentialPages.add(page);
+      // Record the tab before the value moves: detach, shutdown and every later
+      // attach in this process close it, whether or not it navigated since. The
+      // document marker is the fallback for a process that dies. Every refusal
+      // up to the fill below is permission-denied: nothing has been typed.
+      const targetId = await this.targetId(attached.context, page);
+      if (targetId === undefined) fail("permission-denied");
+      const filledBefore = this.filledTargets.has(targetId);
+      this.filledPages.set(page, targetId);
+      this.filledTargets.add(targetId);
       let marked: unknown;
-      try { marked = await page.evaluate(writeCredentialMarker, CREDENTIAL_MARKER); } catch { fail("verification-failed"); }
-      if (marked !== true) fail("verification-failed");
+      try { marked = await page.evaluate(writeCredentialMarker, CREDENTIAL_MARKER); } catch { marked = false; }
+      if (marked !== true) {
+        // Nothing was typed by this attempt; keep only an earlier fill's record.
+        if (!filledBefore) { this.filledPages.delete(page); this.filledTargets.delete(targetId); }
+        fail("permission-denied");
+      }
       if (this.attachment !== attached) fail("session-lost");
       if (deadline - Date.now() < CREDENTIAL_FILL_WAIT_MS + this.selectionClearMs) fail("timeout");
       // The last check before the value moves; nothing awaits between it and the fill.
@@ -1198,6 +1336,7 @@ export class NodeAdapter implements BridgeAdapter {
     return execFile(command, args, { encoding: "buffer", maxBuffer: maxBytes, timeout: MAX_DRAIN_MS, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", DISPLAY: ":1", HOME: "/config" } });
   }
   clearSelections(): Promise<void> { return clearSeatSelections(); }
+  credentialPolicy(): Promise<boolean> { return readCredentialPolicy(); }
   async launchMousepad(): Promise<LaunchedMousepad> {
     // Mousepad restores its previous session from XDG state. Give this child a
     // private, bridge-created profile instead of allowing it to read or mutate

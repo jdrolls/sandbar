@@ -34,6 +34,8 @@ if [ "$*" = "-u abc -x chromium" ] && [ "\${SANDBAR_TEST_EXISTING_BROWSER:-0}" =
 if [ "$*" = "-u abc -x chromium" ]; then exit 1; fi
 `);
   executable(directory, "install", "printf 'install %s\\n' \"$*\" >> \"$SANDBAR_TEST_LOG\"\n");
+  // One argument per line, so paths with spaces stay distinguishable.
+  executable(directory, "rm", "printf 'rm' >> \"$SANDBAR_TEST_LOG\"\nfor argument in \"$@\"; do printf ' [%s]' \"$argument\" >> \"$SANDBAR_TEST_LOG\"; done\nprintf '\\n' >> \"$SANDBAR_TEST_LOG\"\n");
   executable(directory, "chromium", "printf 'chromium %s\\n' \"$*\" >> \"$SANDBAR_TEST_LOG\"\n");
   executable(directory, "s6-setuidgid", `printf 's6-setuidgid %s\\n' "$*" >> "$SANDBAR_TEST_LOG"
 shift
@@ -124,8 +126,19 @@ describe("shared-browser seat startup", () => {
     expect(result.exitCode).toBe(0);
     expect(result.log).toContain("pgrep -u abc -x chromium\n");
     expect(result.log).toContain("install -d -m 0700 -o abc -g abc /config/sandbar-browser\n");
-    expect(result.log).toContain("chromium --user-data-dir=/config/sandbar-browser --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --no-first-run --no-default-browser-check\n");
+    expect(result.log).toContain("chromium --user-data-dir=/config/sandbar-browser --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --no-first-run --no-default-browser-check --hide-crash-restore-bubble\n");
     expect(result.log).not.toMatch(/--(?:no-sandbox|disable-[^ ]*sandbox|single-process)/);
+  });
+
+  test("starts every browser with no stored session, removed as abc before launch", () => {
+    const result = runService({ SANDBAR_SHARED_BROWSER: "1", SANDBAR_BROWSER_SANDBOX: "namespace" });
+    expect(result.exitCode).toBe(0);
+    const removal = "s6-setuidgid abc rm -rf -- /config/sandbar-browser/Default/Sessions /config/sandbar-browser/Default/Sessions_Encrypted /config/sandbar-browser/Default/Current Session /config/sandbar-browser/Default/Current Tabs /config/sandbar-browser/Default/Last Session /config/sandbar-browser/Default/Last Tabs\n";
+    const removed = "rm [-rf] [--] [/config/sandbar-browser/Default/Sessions] [/config/sandbar-browser/Default/Sessions_Encrypted] [/config/sandbar-browser/Default/Current Session] [/config/sandbar-browser/Default/Current Tabs] [/config/sandbar-browser/Default/Last Session] [/config/sandbar-browser/Default/Last Tabs]\n";
+    expect(result.log).toContain(removal);
+    expect(result.log).toContain(removed);
+    expect(result.log.indexOf(removed)).toBeLessThan(result.log.indexOf("chromium --user-data-dir"));
+    expect(result.log.indexOf("install -d -m 0700 -o abc -g abc /config/sandbar-browser\n")).toBeLessThan(result.log.indexOf(removed));
   });
 
   test("does not start a second browser or accept unsafe inherited flags", () => {

@@ -40,10 +40,13 @@ LABEL org.opencontainers.image.source="https://github.com/jdrolls/sandbar" \
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# xsel (also in the Webtop base) is declared because the browser bridge depends
+# on it: it clears the seat's CLIPBOARD and PRIMARY selections around every
+# credential fill, attach and detach, and an attach fails closed without it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl git python3 python3-venv tmux jq xz-utils \
-        at-spi2-core dbus-x11 xdotool wmctrl scrot \
+        at-spi2-core dbus-x11 xdotool wmctrl scrot xsel \
         ripgrep ffmpeg chromium \
     && rm -rf /var/lib/apt/lists/*
 

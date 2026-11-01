@@ -16,9 +16,11 @@ by `sandbar-browser`. `attach` requires both `SANDBAR_SHARED_BROWSER=1` and
 and disconnects without closing Chromium. `detach` removes the HTTP route and
 event observers, clears in-memory diagnostics/downloads, then disconnects the
 CDP client. Playwright 1.63 has `routeWebSocket` but no `unrouteWebSocket`; the
-client disconnect is its supported WebSocket-route cleanup lifecycle. Attach
-rejects a context that already has service workers, and immediately disconnects
-if one appears, because service-worker requests can bypass route interception.
+client disconnect is its supported WebSocket-route cleanup lifecycle. No
+service worker may run while the bridge is attached, because service-worker
+requests can bypass route interception: attach blocks registration and clears
+the workers earlier sessions left, refuses a worker it cannot clear, and
+disconnects if one appears mid-lease (see [Service workers](#service-workers)).
 
 `attach` also accepts an optional `inputScope`, `"full"` (the default when
 absent) or `"qa-layout"`. Any other value, or `"qa-layout"` with
@@ -87,6 +89,86 @@ A selector that matches several elements (Playwright strict mode) or does not
 parse returns `invalid-request`, not `provider-unavailable`; narrow it, e.g.
 `".gallery-item >> nth=0"`. `provider-unavailable` stays reserved for transport
 and browser failures.
+
+## Service workers
+
+The origin route is the lease's fence, and service workers sit outside it:
+Playwright's context routes do not reliably intercept a worker's own
+requests, so a worker could send requests the route would abort. Earlier
+bridges therefore refused any context with a running service worker. Many
+sites register one on page load, so such a site could never be driven, and
+while any tab kept a worker alive every lease on the seat failed.
+
+Now no worker runs on the seat while it is leased:
+
+1. **Registration is blocked first.** Attach installs a context init script
+   that replaces `ServiceWorkerContainer.prototype.register` with a function
+   that rejects with a `SecurityError`, which is how Chromium itself answers when
+   site storage is blocked. The property is non-writable and non-configurable,
+   so page script cannot put the original back. Playwright runs the script in
+   every new document before page script, in child frames, popups and
+   `about:blank` iframes too. Attach also evaluates it into every frame
+   already open. A page that registers on load gets a rejected promise and carries on
+   without a worker. Dedicated workers and insecure contexts have no
+   `navigator.serviceWorker`, so they cannot register.
+2. **Earlier workers are cleared next.** Through one tab's CDP session, attach
+   reads every registration in the profile (`ServiceWorker.enable`). It deletes
+   each `http`/`https` one with `Storage.clearDataForOrigin` (storage type
+   `service_workers` only, so cookies, caches and other site data stay), then
+   stops each web worker still running (`ServiceWorker.stopWorker`). Unlike
+   `ServiceWorker.unregister`, the delete also releases tabs the worker
+   controlled, so their requests go to the network and through the route. The
+   whole exchange is bounded (5 s per tab, at most 3 tabs tried). A tab that
+   cannot answer, a malformed report, or a failed delete returns
+   `verification-failed`, and no route is installed.
+3. **The old refusal is the safety net.** Stopped workers must leave
+   Playwright's worker list within 2 s. Any worker still listed keeps the
+   original answers: `permission-denied` if any is off the lease origins,
+   otherwise `verification-failed`. Attach checks the list again after the
+   `serviceworker` listener is installed, so a worker that starts in between is
+   refused too. A worker that appears mid-lease still drops the lease
+   (`session-lost`). Browser-internal workers (`chrome-extension:`) are never
+   stopped or deleted. Stopping one leaves Playwright a session that never
+   answers, which stalls route setup. A running one still refuses attach, as
+   before.
+
+Why the bridge does it this way: Chromium has no switch for this. Its managed
+policies (`policies.yaml` in Chromium's policy templates, checked for this
+change) have no setting that turns service workers off. The only
+service-worker policies are `ServiceWorkerToControlSrcdocIframeEnabled`,
+`PrefetchWithServiceWorkerEnabled`, `ServiceWorkerAutoPreloadEnabled` and
+`RestrictBackgroundFetchFromServiceWorkerEnabled`. There is no
+`Default…Setting` for service workers either. Blocking site storage
+(`DefaultCookiesSetting`) would stop them, but it would also break every
+login. Chromium's content and browser switch lists and its content feature
+list have no service-worker kill switch either, so no launch flag in
+`sandbar-browser` can do it. CDP is the only mechanism the bridge can reach. Block-before-clear
+leaves no window in which a cleared site can register again, and the final list
+check covers the gap before the listener exists.
+
+What this costs and what is left:
+
+- Clearing deletes every site's service-worker registration on the seat
+  profile at every attach, including any push subscription tied to it. Sites
+  re-register when visited outside a lease. The block lives on the bridge's CDP
+  connection, so it stops at detach for new documents. A document that was
+  already open at attach stays blocked until it reloads.
+- The block is page JavaScript, not a browser setting. A document already open
+  at attach that saved its own reference to `register` before the bridge
+  arrived can still call it. A registration keyed to a third-party top-level
+  site (a worker registered inside a cross-site iframe) is not deleted by
+  `Storage.clearDataForOrigin`. Either way, the worker only runs if Chromium
+  starts it, and then the safety net refuses the attach or ends the lease. None
+  of these cases lets traffic past the route unseen. In each one, the lease
+  fails closed.
+- Tested against Chrome for Testing 156 with this bridge's bundle over CDP.
+  Two workers left by an earlier client were cleared, one of them controlling
+  an open tab. That tab was released, and its next request went to the
+  network. A leased tab whose page registers on load got the `SecurityError`
+  and stayed leased, and no worker script was fetched. That run used no
+  extension workers (Chrome for Testing ships two, which refuse attach as
+  described above). The image's Debian Chromium and a live seat were not
+  part of it.
 
 ## Credential broker operations
 

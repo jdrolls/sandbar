@@ -74,6 +74,17 @@ const CREDENTIAL_MARKER_WAIT_MS = 2_000;
 // volume and is gone when the container stops.
 const TARGET_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const MAX_TRACKED_TARGETS = 1024;
+// Attach locks the registration block into each open frame within the block
+// wait, then clears service workers through one tab's CDP session: the
+// snapshot, the deletes and the stops must all finish within the clear bound,
+// and at most this many tabs are tried. Stopped workers must then leave
+// Playwright's list within the drain bound, or attach refuses.
+const SERVICE_WORKER_BLOCK_WAIT_MS = 2_000;
+const SERVICE_WORKER_CLEAR_MS = 5_000;
+const SERVICE_WORKER_CLEAR_TABS = 3;
+const SERVICE_WORKER_DRAIN_MS = 2_000;
+const SERVICE_WORKER_POLL_MS = 25;
+const MAX_SERVICE_WORKER_ENTRIES = 1024;
 export const FILLED_TARGETS_DIR = "/dev/shm/sandbar-bridge";
 const FILLED_TARGETS_FILE = "filled-targets";
 // Serialized into the page by page.evaluate; both close over nothing. The marker
@@ -84,6 +95,26 @@ export function writeCredentialMarker(key: string): boolean {
 }
 // Any own property under the key counts as marked: a page can only fail closed.
 export function readCredentialMarker(key: string): boolean { return Object.getOwnPropertyDescriptor(globalThis, key) !== undefined; }
+// Chromium has no managed policy or launch switch that turns service workers
+// off (blocking site storage would, but it also blocks every login), so the
+// bridge blocks registration in the page itself. This runs as a context init
+// script in every new document and frame realm while leased (Playwright runs it
+// before page script, popups and about:blank iframes included) and is
+// evaluated into documents already open at attach. register() gets Chromium's
+// own denial, a SecurityError rejection, so a page that registers on load
+// carries on without a worker. The property is non-writable and
+// non-configurable: page script cannot restore it in that realm. Serialized by
+// Playwright, so it closes over nothing. A realm with no ServiceWorkerContainer
+// (an insecure context, a dedicated worker) cannot register at all.
+export function blockServiceWorkerRegistration(): void {
+  const container = (globalThis as { ServiceWorkerContainer?: { prototype: object } }).ServiceWorkerContainer;
+  if (!container) return;
+  const register = function register(): Promise<never> { return Promise.reject(new DOMException("Service workers are disabled on this browser seat.", "SecurityError")); };
+  // Throws when the property is already non-configurable: an earlier run in
+  // this realm, or a document open before attach that locked it first. The
+  // bridge's service-worker checks still cover the latter.
+  try { Object.defineProperty(container.prototype, "register", { value: register, writable: false, configurable: false, enumerable: true }); } catch { /* already locked */ }
+}
 // What the in-page probe reports about the target input. Every value is read
 // through the window's own native prototypes (Element, Node, HTMLInputElement,
 // HTMLFormElement), so a form control named "method" or "elements", or an own
@@ -389,6 +420,10 @@ const ARIA_VALUE_ROLE = "(?:textbox|searchbox|combobox|spinbutton|slider)";
 const ARIA_VALUE_ROLES = new RegExp(`^(\\s*- (?:${ARIA_VALUE_ROLE}(?: "(?:[^"\\\\]|\\\\.)*")?(?: \\[[^\\]\\n]*\\])*|'${ARIA_VALUE_ROLE}(?:[^'\\n]|'')*')):[ \\t]*\\S.*$`, "gm");
 const ARIA_URL_PROPERTY = /^\s*- \/url:.*(?:\n|$)/gm;
 export function redactAriaValues(tree: string): string { return tree.replace(ARIA_URL_PROPERTY, "").replace(ARIA_VALUE_ROLES, (_line, head: string) => `${head}: [redacted]`); }
+// The origin of an http(s) URL; undefined for any other scheme or an unparsable URL.
+function webOrigin(value: string): string | undefined {
+  try { const url = new URL(value); return url.protocol === "http:" || url.protocol === "https:" ? url.origin : undefined; } catch { return undefined; }
+}
 function truncate(value: string, max = MAX_TEXT): string { return value.length > max ? value.slice(0, max) : value; }
 function opaque(value: unknown): string { const id = string(value, 128); if (!/^[A-Za-z0-9_-]+$/.test(id)) fail("invalid-request"); return id; }
 function safeError(error: unknown): ErrorCode {
@@ -473,7 +508,7 @@ export class BrowserBridge {
   private dispatch: Promise<void> = Promise.resolve();
   private ending = false;
 
-  constructor(private readonly adapter: BridgeAdapter, private readonly requestDeadlineMs = REQUEST_DEADLINE_MS, private readonly clickSettleMs = CLICK_SETTLE_MS, private readonly selectionClearMs = MAX_DRAIN_MS) {}
+  constructor(private readonly adapter: BridgeAdapter, private readonly requestDeadlineMs = REQUEST_DEADLINE_MS, private readonly clickSettleMs = CLICK_SETTLE_MS, private readonly selectionClearMs = MAX_DRAIN_MS, private readonly serviceWorkerClearMs = SERVICE_WORKER_CLEAR_MS, private readonly serviceWorkerDrainMs = SERVICE_WORKER_DRAIN_MS) {}
 
   handle(request: unknown): Promise<BridgeResponse> {
     if (this.ending) return Promise.resolve({ id: "invalid", ok: false, code: "session-lost" });
@@ -648,20 +683,21 @@ export class BrowserBridge {
     // WebSockets, but intentionally has no unrouteWebSocket. Closing a Browser
     // returned by connectOverCDP is the supported client-disconnect lifecycle;
     // it tears down both route registrations without closing Chromium.
-    if (typeof context.route !== "function" || typeof context.unroute !== "function" || typeof context.routeWebSocket !== "function" || typeof context.serviceWorkers !== "function") {
+    if (typeof context.route !== "function" || typeof context.unroute !== "function" || typeof context.routeWebSocket !== "function" || typeof context.serviceWorkers !== "function" || typeof context.addInitScript !== "function" || typeof context.newCDPSession !== "function") {
       await this.closeConnection(browser).catch(() => undefined); fail("unsupported-capability");
     }
-    let workers: any[];
-    try { workers = context.serviceWorkers(); } catch { await this.closeConnection(browser).catch(() => undefined); fail("provider-unavailable"); }
-    if (!Array.isArray(workers)) { await this.closeConnection(browser).catch(() => undefined); fail("provider-unavailable"); }
-    // BrowserContext routes do not reliably intercept service-worker traffic.
-    // Existing workers are therefore incompatible with this restricted client.
-    // Check worker origins before rejecting so a foreign worker cannot be
-    // mistaken for an approved context state.
-    for (const worker of workers) {
-      if (!origins.has(this.workerOrigin(worker))) { await this.closeConnection(browser).catch(() => undefined); fail("permission-denied"); }
-    }
-    if (workers.length > 0) { await this.closeConnection(browser).catch(() => undefined); fail("verification-failed"); }
+    // BrowserContext routes do not reliably intercept service-worker traffic,
+    // so no worker may run while this client is attached. Block registration
+    // first, so nothing registers again while existing workers are cleared,
+    // then delete every web registration and stop its worker.
+    let stoppedScripts: Set<string>;
+    try { stoppedScripts = await this.blockServiceWorkers(context); } catch { await this.closeConnection(browser).catch(() => undefined); fail("verification-failed"); }
+    // A worker still listed after clearing (one Chromium would not delete or
+    // stop) keeps the original refusal. Check worker origins before rejecting
+    // so a foreign worker cannot be mistaken for an approved context state.
+    const workers = await this.drainedServiceWorkers(context, stoppedScripts);
+    const refusal = this.serviceWorkerRefusal(workers, origins);
+    if (refusal) { await this.closeConnection(browser).catch(() => undefined); fail(refusal); }
     // A tab that received a credential (from an earlier lease of this process,
     // navigated or not, or marked by a bridge process that died) is closed
     // before this attachment can list, select or observe it. A leased-origin
@@ -706,7 +742,125 @@ export class BrowserBridge {
     this.clearBuffers();
     for (const page of context.pages()) this.pageId(page);
     this.installObservers(attachment);
+    // The serviceworker listener covers every worker from here on. One that
+    // started after the drain but before the listener existed is still listed.
+    const late = this.serviceWorkerRefusal(this.listedServiceWorkers(context), origins);
+    if (late) {
+      this.attachment = undefined;
+      this.clearBuffers();
+      await this.closeConnection(browser).catch(() => undefined);
+      fail(late);
+    }
     return { attached: true, pageCount: context.pages().filter((page: any) => this.pageIsApproved(page, attachment)).length };
+  }
+
+  // Undefined when no worker is listed; otherwise the refusal attach has always
+  // given: provider-unavailable when the list cannot be read,
+  // permission-denied when any worker is off the lease origins, and
+  // verification-failed when all are on them.
+  private serviceWorkerRefusal(workers: any[] | undefined, origins: Set<string>): ErrorCode | undefined {
+    if (!workers) return "provider-unavailable";
+    if (workers.length === 0) return undefined;
+    return workers.some((worker) => !origins.has(this.workerOrigin(worker))) ? "permission-denied" : "verification-failed";
+  }
+  private listedServiceWorkers(context: any): any[] | undefined {
+    try { const workers: unknown = context.serviceWorkers(); return Array.isArray(workers) ? workers : undefined; } catch { return undefined; }
+  }
+  // A stopped worker leaves Playwright's list when its target detaches, which
+  // trails the stop slightly. Poll, bounded, while a worker this attach stopped
+  // is still listed; any other listed worker is final at once.
+  private async drainedServiceWorkers(context: any, stoppedScripts: Set<string>): Promise<any[] | undefined> {
+    const deadline = Date.now() + this.serviceWorkerDrainMs;
+    for (;;) {
+      const workers = this.listedServiceWorkers(context);
+      if (!workers || !workers.some((worker) => stoppedScripts.has(this.workerUrl(worker))) || Date.now() >= deadline) return workers;
+      await new Promise<void>((resolve) => setTimeout(resolve, SERVICE_WORKER_POLL_MS));
+    }
+  }
+  // Installs the registration block for every document this client will see,
+  // locks it into documents already open, then clears the registrations that
+  // exist. Resolves to the script URLs of the workers it stopped; throws if the
+  // block cannot be installed or the clear cannot finish.
+  private async blockServiceWorkers(context: any): Promise<Set<string>> {
+    await context.addInitScript(blockServiceWorkerRegistration);
+    const pages: any[] = context.pages();
+    // Best effort and bounded per frame: a frame that cannot run it (crashed,
+    // wedged, a document that locked register first) can still register, and
+    // a worker it starts is refused at attach or ends the lease.
+    await Promise.all(pages.flatMap((page) => this.pageFrames(page).map((frame) => this.settleWithin(() => frame.evaluate(blockServiceWorkerRegistration), SERVICE_WORKER_BLOCK_WAIT_MS))));
+    for (const page of pages.slice(0, SERVICE_WORKER_CLEAR_TABS)) {
+      try { return await this.clearServiceWorkers(context, page); } catch { /* try the next tab */ }
+    }
+    // No tab to clear through, or none that could: registrations may remain.
+    fail("verification-failed");
+  }
+  private pageFrames(page: any): any[] {
+    try { const frames: unknown = page.frames(); return Array.isArray(frames) ? frames : []; } catch { return []; }
+  }
+  // ServiceWorker.enable reports every registration and every version in the
+  // profile, an empty list included, as one event of each kind. Every web
+  // (http/https) registration is deleted through Storage.clearDataForOrigin,
+  // which, unlike ServiceWorker.unregister, also releases the tabs it controls,
+  // so their requests go to the network and its routes. Each web worker still
+  // running is then stopped by version. Only web workers: stopping a
+  // browser-internal (extension) worker leaves Playwright a session that never
+  // answers, which wedges context.route. Throws on a malformed report, a failed
+  // delete, or the whole exchange outlasting its bound; the session is always
+  // detached. A failed stop is not fatal here: attach refuses any worker still
+  // listed afterwards. Resolves to the script URLs of the workers it stopped.
+  private async clearServiceWorkers(context: any, page: any): Promise<Set<string>> {
+    const deadline = Date.now() + this.serviceWorkerClearMs;
+    const within = <T>(work: Promise<T>): Promise<T> => this.bounded(work, "verification-failed", Math.max(0, deadline - Date.now()));
+    const opening: Promise<any> = Promise.resolve().then(() => context.newCDPSession(page));
+    let session: any;
+    // A session that opens after its bound is detached as soon as it does.
+    try { session = await within(opening); } catch (error) { void opening.then((late) => late?.detach?.()).catch(() => undefined); throw error; }
+    try {
+      const origins = new Set<string>();
+      // Latest script and running status per web worker version.
+      const versions = new Map<string, { scriptURL: string; runningStatus: string }>();
+      let reported = 0;
+      let malformed = false;
+      let settle: () => void = () => undefined;
+      const snapshot = new Promise<void>((resolve) => { settle = resolve; });
+      const entries = (value: unknown, key: string): Record<string, unknown>[] => {
+        const list = value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
+        if (!Array.isArray(list) || list.length > MAX_SERVICE_WORKER_ENTRIES || list.some((entry) => !entry || typeof entry !== "object")) { malformed = true; return []; }
+        return list as Record<string, unknown>[];
+      };
+      const note = (bit: number): void => { reported |= bit; if (reported === 3) settle(); };
+      session.on("ServiceWorker.workerRegistrationUpdated", (event: unknown) => {
+        for (const registration of entries(event, "registrations")) {
+          if (typeof registration.scopeURL !== "string" || typeof registration.isDeleted !== "boolean") { malformed = true; continue; }
+          const origin = webOrigin(registration.scopeURL);
+          if (origin && !registration.isDeleted) origins.add(origin);
+        }
+        note(1);
+      });
+      session.on("ServiceWorker.workerVersionUpdated", (event: unknown) => {
+        for (const version of entries(event, "versions")) {
+          if (typeof version.versionId !== "string" || typeof version.scriptURL !== "string" || typeof version.runningStatus !== "string") { malformed = true; continue; }
+          if (webOrigin(version.scriptURL)) versions.set(version.versionId, { scriptURL: version.scriptURL, runningStatus: version.runningStatus });
+        }
+        note(2);
+      });
+      await within(Promise.resolve(session.send("ServiceWorker.enable")));
+      await within(snapshot);
+      if (malformed) fail("verification-failed");
+      // A Set iterates entries added while it is iterated, so a registration
+      // reported mid-clear is deleted too.
+      for (const origin of origins) await within(Promise.resolve(session.send("Storage.clearDataForOrigin", { origin, storageTypes: "service_workers" })));
+      const stoppedScripts = new Set<string>();
+      for (const [versionId, version] of versions) {
+        if (version.runningStatus === "stopped") continue;
+        // Only a worker whose stop was accepted is worth waiting for.
+        if (await within(Promise.resolve(session.send("ServiceWorker.stopWorker", { versionId }))).then(() => true, () => false)) stoppedScripts.add(version.scriptURL);
+      }
+      return stoppedScripts;
+    } finally {
+      // Detaching ends the session's ServiceWorker domain with it.
+      void Promise.resolve().then(() => session.detach?.()).catch(() => undefined);
+    }
   }
 
   private inputScope(value: unknown): InputScope {
@@ -738,7 +892,10 @@ export class BrowserBridge {
       if (this.attachment !== attached) return;
       // BrowserContext routes do not cover service workers. Validate the worker
       // origin and fence the connection even for an approved worker: either can
-      // issue requests outside the HTTP route policy.
+      // issue requests outside the HTTP route policy. Registration is blocked
+      // while leased, so this is the safety net for a worker that got past the
+      // block (a registration attach could not delete, or a document that
+      // kept its own reference to register()).
       const origin = this.workerOrigin(worker);
       if (!attached.origins.has(origin)) {
         this.attachment = undefined;
@@ -767,6 +924,9 @@ export class BrowserBridge {
   }
   private workerOrigin(worker: any): string {
     try { return new URL(String(worker.url?.() ?? "")).origin; } catch { return ""; }
+  }
+  private workerUrl(worker: any): string {
+    try { return String(worker.url?.() ?? ""); } catch { return ""; }
   }
   private eventTabId(request: any): string | undefined {
     try { const page = request?.frame?.()?.page?.(); return page ? this.pageId(page) : undefined; } catch { return undefined; }

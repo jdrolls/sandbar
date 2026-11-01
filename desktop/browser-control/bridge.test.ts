@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import { BrowserBridge, CHROMIUM_MANAGED_POLICY_DIR, CREDENTIAL_POLICY, FILLED_TARGETS_DIR, NodeAdapter, credentialPolicyHolds, loadFilledTargetIds, saveFilledTargetIds, probeCredentialField, probeSubmitControl, readCredentialMarker, readCredentialPolicy, redactAriaValues, writeCredentialMarker, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
+import { BrowserBridge, blockServiceWorkerRegistration, CHROMIUM_MANAGED_POLICY_DIR, CREDENTIAL_POLICY, FILLED_TARGETS_DIR, NodeAdapter, credentialPolicyHolds, loadFilledTargetIds, saveFilledTargetIds, probeCredentialField, probeSubmitControl, readCredentialMarker, readCredentialPolicy, redactAriaValues, writeCredentialMarker, type BridgeAdapter, type BridgeResponse, type LaunchedMousepad } from "./bridge";
 
 class FakePage {
   events = new Map<string, Function[]>();
@@ -28,6 +28,8 @@ class FakePage {
   // The browser's target id: stable for the tab, unlike this wrapper object.
   targetId = `TARGET${Math.random().toString(16).slice(2, 14).toUpperCase()}`;
   targetIdError?: Error;
+  // newCDPSession on this page rejects with it.
+  cdpSessionError?: Error;
   async close(): Promise<void> { if (this.closeFailures > 0) { this.closeFailures--; throw new Error("page.close: Protocol error"); } this.closed++; }
   // A cross-document navigation replaces the document, and with it the marker.
   async goto(url: string): Promise<void> { this.gotoUrls.push(url); this.urlValue = url; this.credentialMarker = false; }
@@ -43,7 +45,11 @@ class FakePage {
   async waitForTimeout(_milliseconds: number): Promise<void> {}
   layoutMetrics: unknown = { scrollWidth: 1440, scrollHeight: 5200, clientWidth: 1440, clientHeight: 900, innerWidth: 1440, innerHeight: 900 };
   evaluated: Function[] = [];
+  // Times the service-worker registration block was evaluated into this document.
+  serviceWorkerBlocks = 0;
+  serviceWorkerBlockError?: Error;
   async evaluate(fn: Function, arg?: unknown): Promise<unknown> {
+    if (fn === blockServiceWorkerRegistration) { if (this.serviceWorkerBlockError) throw this.serviceWorkerBlockError; this.serviceWorkerBlocks++; return undefined; }
     if (fn === writeCredentialMarker) { expect(arg).toBe("__sandbarCredentialFill"); if (this.markerWriteResult === true) this.credentialMarker = true; return this.markerWriteResult; }
     if (fn === readCredentialMarker) { expect(arg).toBe("__sandbarCredentialFill"); if (this.markerReadError) throw this.markerReadError; return this.credentialMarker; }
     this.evaluated.push(fn); return this.layoutMetrics;
@@ -53,6 +59,15 @@ class FakeWorker {
   constructor(private readonly urlValue: string) {}
   url(): string { return this.urlValue; }
 }
+// A service-worker registration and its one version, as the ServiceWorker CDP domain reports them.
+interface FakeRegistration {
+  registrationId: string; scopeURL: string; isDeleted: boolean; versionId: string; scriptURL: string; runningStatus: string; status: string;
+  worker?: FakeWorker;
+  // Keyed to a third-party top-level site: Storage.clearDataForOrigin does not delete it.
+  partitioned: boolean;
+  // Its worker keeps running (and stays listed) after ServiceWorker.stopWorker.
+  survivesStop: boolean;
+}
 class FakeContext {
   page = new FakePage();
   routes: Array<{ pattern: string; handler: Function }> = [];
@@ -60,19 +75,71 @@ class FakeContext {
   workers: FakeWorker[] = [];
   events = new Map<string, Function[]>();
   allPages: FakePage[] = [this.page];
+  // Ordered record of the calls that build the fence: init scripts, routes and CDP commands.
+  calls: string[] = [];
+  initScripts: Function[] = [];
+  initScriptError?: Error;
+  registrations: FakeRegistration[] = [];
+  // ServiceWorker.enable reports its snapshot unless this is false; `malformedSnapshot` replaces it with a bad payload.
+  reportsSnapshot = true;
+  malformedSnapshot = false;
+  cdpFailures: Record<string, Error> = {};
+  clearedOrigins: string[] = [];
+  stoppedVersions: string[] = [];
+  onRoute?: () => void;
   // As Playwright: a closed page leaves the context's page list.
   pages(): FakePage[] { return this.allPages.filter((page) => page.closed === 0); }
   serviceWorkers(): FakeWorker[] { return this.workers; }
+  // A registration whose worker is listed by Playwright while running, as an earlier session would leave it.
+  registerWorker(scriptURL: string, options: { running?: boolean; partitioned?: boolean; survivesStop?: boolean } = {}): FakeRegistration {
+    const id = String(this.registrations.length);
+    const running = options.running ?? true;
+    const registration: FakeRegistration = { registrationId: id, scopeURL: new URL("./", scriptURL).href, isDeleted: false, versionId: `v${id}`, scriptURL, runningStatus: running ? "running" : "stopped", status: "activated", partitioned: options.partitioned ?? false, survivesStop: options.survivesStop ?? false };
+    if (running) { registration.worker = new FakeWorker(scriptURL); this.workers.push(registration.worker); }
+    this.registrations.push(registration);
+    return registration;
+  }
+  async addInitScript(script: Function): Promise<void> { this.calls.push("addInitScript"); if (this.initScriptError) throw this.initScriptError; this.initScripts.push(script); }
   cdpSessions = 0; detachedSessions = 0;
-  async newCDPSession(page: FakePage): Promise<{ send: (method: string) => Promise<unknown>; detach: () => Promise<void> }> {
+  async newCDPSession(page: FakePage): Promise<{ on: (name: string, callback: Function) => void; send: (method: string, params?: Record<string, unknown>) => Promise<unknown>; detach: () => Promise<void> }> {
+    if (page.cdpSessionError) throw page.cdpSessionError;
     this.cdpSessions++;
+    const listeners = new Map<string, Function[]>();
+    const emit = (name: string, value: unknown): void => { for (const callback of listeners.get(name) ?? []) callback(value); };
     return {
-      send: async (method: string) => { expect(method).toBe("Target.getTargetInfo"); if (page.targetIdError) throw page.targetIdError; return { targetInfo: { targetId: page.targetId, type: "page" } }; },
+      on: (name: string, callback: Function) => { listeners.set(name, [...(listeners.get(name) ?? []), callback]); },
+      send: async (method: string, params: Record<string, unknown> = {}) => {
+        this.calls.push(`cdp:${method}`);
+        if (this.cdpFailures[method]) throw this.cdpFailures[method];
+        switch (method) {
+          case "Target.getTargetInfo": if (page.targetIdError) throw page.targetIdError; return { targetInfo: { targetId: page.targetId, type: "page" } };
+          case "ServiceWorker.enable":
+            // Chromium reports the snapshot after answering the command.
+            if (this.reportsSnapshot) setTimeout(() => {
+              if (this.malformedSnapshot) { emit("ServiceWorker.workerRegistrationUpdated", { registrations: [{ registrationId: "0", scopeURL: 7, isDeleted: false }] }); emit("ServiceWorker.workerVersionUpdated", { versions: [] }); return; }
+              emit("ServiceWorker.workerRegistrationUpdated", { registrations: this.registrations.map(({ registrationId, scopeURL, isDeleted }) => ({ registrationId, scopeURL, isDeleted })) });
+              emit("ServiceWorker.workerVersionUpdated", { versions: this.registrations.map(({ versionId, registrationId, scriptURL, runningStatus, status }) => ({ versionId, registrationId, scriptURL, runningStatus, status, controlledClients: [] })) });
+            }, 0);
+            return {};
+          case "Storage.clearDataForOrigin":
+            expect(params.storageTypes).toBe("service_workers");
+            this.clearedOrigins.push(String(params.origin));
+            for (const registration of this.registrations) if (!registration.partitioned && new URL(registration.scopeURL).origin === params.origin) { registration.isDeleted = true; registration.status = "redundant"; }
+            return {};
+          case "ServiceWorker.stopWorker": {
+            this.stoppedVersions.push(String(params.versionId));
+            const registration = this.registrations.find((entry) => entry.versionId === params.versionId);
+            if (registration && !registration.survivesStop) { registration.runningStatus = "stopped"; this.workers = this.workers.filter((worker) => worker !== registration.worker); }
+            return {};
+          }
+          default: throw new Error(`unexpected CDP command ${method}`);
+        }
+      },
       detach: async () => { this.detachedSessions++; },
     };
   }
   async newPage(): Promise<FakePage> { const page = new FakePage("about:blank"); this.allPages.push(page); for (const listener of this.events.get("page") ?? []) listener(page); return page; }
-  async route(pattern: string, handler: Function): Promise<void> { this.routes.push({ pattern, handler }); }
+  async route(pattern: string, handler: Function): Promise<void> { this.calls.push("route"); this.onRoute?.(); this.routes.push({ pattern, handler }); }
   async routeWebSocket(_pattern: string, handler: Function): Promise<void> { this.websocketRoutes.push(handler); }
   async unroute(_pattern: string, handler: Function): Promise<void> { this.routes = this.routes.filter((route) => route.handler !== handler); }
   on(name: string, callback: Function): void { this.events.set(name, [...(this.events.get(name) ?? []), callback]); }
@@ -272,6 +339,158 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
     cleanAdapter.browser.context.events.get("serviceworker")?.[0](new FakeWorker("https://private.test/sw.js"));
     expect(await cleanBridge.handle(request("after-worker", "tabs", {}))).toMatchObject({ ok: false, code: "session-lost" });
     expect(cleanAdapter.browser.closedConnections).toBe(1);
+  });
+
+  describe("service workers (sandbar i17)", () => {
+    // The fourth and fifth constructor bounds: the service-worker clear and the stopped-worker drain.
+    function swBridge(adapter: FakeAdapter, clearMs?: number, drainMs = 50): BrowserBridge { return new BrowserBridge(adapter, undefined, undefined, undefined, clearMs, drainMs); }
+    function index(context: FakeContext, call: string): number { const at = context.calls.indexOf(call); expect(at).toBeGreaterThanOrEqual(0); return at; }
+
+    test("blocks registration in every document, then clears earlier workers before the fence goes up", async () => {
+      configured(); const adapter = new FakeAdapter(); const context = adapter.browser.context;
+      // Left by earlier sessions: a running worker on the lease origin, one on a foreign origin
+      // (each refused attach before), a stopped one, and a browser-internal one.
+      context.registerWorker("https://example.test/sw.js");
+      context.registerWorker("https://private.test/sw.js");
+      context.registerWorker("https://example.test/app/sw.js", { running: false });
+      context.registerWorker("chrome-extension://abcdefghijklmnop/background.js", { running: false });
+      const bridge = swBridge(adapter);
+      expect(await attach(bridge)).toMatchObject({ ok: true, result: { attached: true, pageCount: 1 } });
+      expect(context.initScripts).toEqual([blockServiceWorkerRegistration]);
+      expect(context.page.serviceWorkerBlocks).toBe(1);
+      expect([...context.clearedOrigins].sort()).toEqual(["https://example.test", "https://private.test"]);
+      // Only running web workers are stopped; a browser-internal worker is never touched.
+      expect(context.stoppedVersions).toEqual(["v0", "v1"]);
+      expect(context.workers).toEqual([]);
+      // The block precedes the clear, and both precede the origin route.
+      expect(index(context, "addInitScript")).toBeLessThan(index(context, "cdp:ServiceWorker.enable"));
+      expect(index(context, "cdp:ServiceWorker.enable")).toBeLessThan(index(context, "cdp:Storage.clearDataForOrigin"));
+      expect(index(context, "cdp:ServiceWorker.stopWorker")).toBeLessThan(index(context, "route"));
+      expect(context.detachedSessions).toBe(context.cdpSessions);
+      expect(adapter.browser.closedConnections).toBe(0);
+      // The fence is intact: the origin route still aborts a mutation.
+      const route = { request: () => ({ url: () => "https://example.test/path", method: () => "POST" }), abort: async () => { route.aborted = true; }, continue: async () => { route.continued = true; }, aborted: false, continued: false };
+      await context.routes[0].handler(route);
+      expect(route.aborted).toBe(true);
+      expect(await bridge.handle(request("tabs", "tabs", {}))).toMatchObject({ ok: true });
+    });
+
+    test("an empty profile attaches with the block installed and nothing cleared", async () => {
+      configured(); const adapter = new FakeAdapter(); const context = adapter.browser.context;
+      expect(await attach(swBridge(adapter))).toMatchObject({ ok: true });
+      expect(context.initScripts).toEqual([blockServiceWorkerRegistration]);
+      expect(context.clearedOrigins).toEqual([]);
+      expect(context.stoppedVersions).toEqual([]);
+    });
+
+    test("the block runs in every frame of every open tab, and a frame that cannot run it does not stop attach", async () => {
+      configured(); const adapter = new FakeAdapter(); const context = adapter.browser.context;
+      const child = new FakePage("https://example.test/frame"); context.page.frames = () => [context.page, child];
+      const other = new FakePage("https://private.test/"); other.serviceWorkerBlockError = new Error("Execution context was destroyed"); context.allPages.push(other);
+      expect(await attach(swBridge(adapter))).toMatchObject({ ok: true });
+      expect(context.page.serviceWorkerBlocks).toBe(1);
+      expect(child.serviceWorkerBlocks).toBe(1);
+      expect(other.serviceWorkerBlocks).toBe(0);
+    });
+
+    test("blockServiceWorkerRegistration rejects register with SecurityError and cannot be undone", async () => {
+      const holder = globalThis as { ServiceWorkerContainer?: unknown };
+      expect(holder.ServiceWorkerContainer).toBeUndefined();
+      // A realm without the interface (an insecure context, a dedicated worker) is left alone.
+      expect(() => blockServiceWorkerRegistration()).not.toThrow();
+      class ServiceWorkerContainer { register(_url: string): Promise<string> { return Promise.resolve("registered"); } }
+      holder.ServiceWorkerContainer = ServiceWorkerContainer;
+      try {
+        blockServiceWorkerRegistration();
+        const outcome = await new ServiceWorkerContainer().register("/sw.js").then(() => "registered", (error: unknown) => error);
+        expect(outcome).toBeInstanceOf(DOMException);
+        expect((outcome as DOMException).name).toBe("SecurityError");
+        const prototype = ServiceWorkerContainer.prototype as { register: unknown };
+        expect(() => Object.defineProperty(prototype, "register", { value: () => Promise.resolve("registered") })).toThrow(TypeError);
+        expect(() => { prototype.register = () => Promise.resolve("registered"); }).toThrow(TypeError);
+        expect(() => { delete prototype.register; }).toThrow(TypeError);
+        // A second run in the same realm (an init script after an evaluate) is harmless.
+        expect(() => blockServiceWorkerRegistration()).not.toThrow();
+        expect(await new ServiceWorkerContainer().register("/sw.js").then(() => "registered", (error: DOMException) => error.name)).toBe("SecurityError");
+      } finally { delete holder.ServiceWorkerContainer; }
+    });
+
+    test("a worker that survives the clear keeps the original refusals", async () => {
+      configured();
+      // Partitioned registrations are not deleted by origin, and this worker ignores its stop.
+      const approved = new FakeAdapter(); approved.browser.context.registerWorker("https://example.test/sw.js", { partitioned: true, survivesStop: true });
+      expect(await attach(swBridge(approved))).toMatchObject({ ok: false, code: "verification-failed" });
+      expect(approved.browser.closedConnections).toBe(1);
+      expect(approved.browser.context.routes).toEqual([]);
+      const foreign = new FakeAdapter(); foreign.browser.context.registerWorker("https://private.test/sw.js", { partitioned: true, survivesStop: true });
+      foreign.browser.context.registerWorker("https://example.test/sw.js");
+      expect(await attach(swBridge(foreign))).toMatchObject({ ok: false, code: "permission-denied" });
+      expect(foreign.browser.closedConnections).toBe(1);
+      expect(foreign.browser.context.routes).toEqual([]);
+      // A stop Chromium refuses is not waited for: the refusal is immediate.
+      const unstoppable = new FakeAdapter(); unstoppable.browser.context.registerWorker("https://example.test/sw.js", { partitioned: true });
+      unstoppable.browser.context.cdpFailures["ServiceWorker.stopWorker"] = new Error("Protocol error (ServiceWorker.stopWorker)");
+      const started = Date.now();
+      expect(await attach(swBridge(unstoppable, undefined, 5_000))).toMatchObject({ ok: false, code: "verification-failed" });
+      expect(Date.now() - started).toBeLessThan(1_000);
+      // A browser-internal worker cannot be cleared and is off every lease origin.
+      const internal = new FakeAdapter(); internal.browser.context.workers.push(new FakeWorker("chrome-extension://abcdefghijklmnop/background.js"));
+      expect(await attach(swBridge(internal))).toMatchObject({ ok: false, code: "permission-denied" });
+      expect(internal.browser.context.stoppedVersions).toEqual([]);
+    });
+
+    test("refuses attach when existing workers cannot be cleared", async () => {
+      configured();
+      const cases: Array<[string, (context: FakeContext) => void]> = [
+        ["init script", (context) => { context.initScriptError = new Error("Target closed"); }],
+        ["enable", (context) => { context.cdpFailures["ServiceWorker.enable"] = new Error("'ServiceWorker.enable' wasn't found"); }],
+        ["delete", (context) => { context.registerWorker("https://example.test/sw.js"); context.cdpFailures["Storage.clearDataForOrigin"] = new Error("Internal error"); }],
+        ["malformed snapshot", (context) => { context.malformedSnapshot = true; }],
+        ["no snapshot", (context) => { context.reportsSnapshot = false; }],
+        ["no tab", (context) => { context.allPages = []; }],
+        ["no session", (context) => { context.page.cdpSessionError = new Error("Target closed"); }],
+      ];
+      for (const [name, setup] of cases) {
+        const adapter = new FakeAdapter(); setup(adapter.browser.context);
+        const response = await attach(swBridge(adapter, 50));
+        expect({ name, response }).toMatchObject({ name, response: { ok: false, code: "verification-failed" } });
+        expect({ name, closed: adapter.browser.closedConnections, routes: adapter.browser.context.routes.length }).toEqual({ name, closed: 1, routes: 0 });
+        await eventually(() => adapter.browser.context.detachedSessions === adapter.browser.context.cdpSessions ? true : undefined);
+      }
+    });
+
+    test("clears through the next tab when the first cannot answer", async () => {
+      configured(); const adapter = new FakeAdapter(); const context = adapter.browser.context;
+      context.page.cdpSessionError = new Error("Target crashed");
+      context.allPages.push(new FakePage("https://example.test/second"));
+      context.registerWorker("https://example.test/sw.js");
+      expect(await attach(swBridge(adapter))).toMatchObject({ ok: true });
+      expect(context.clearedOrigins).toEqual(["https://example.test"]);
+      expect(context.workers).toEqual([]);
+    });
+
+    test("a worker that starts while attach is still fencing fails closed", async () => {
+      configured();
+      for (const [url, code] of [["https://example.test/late.js", "verification-failed"], ["https://private.test/late.js", "permission-denied"]] as const) {
+        const adapter = new FakeAdapter(); const context = adapter.browser.context;
+        // Starts after the clear, before the serviceworker listener exists.
+        context.onRoute = () => { context.workers.push(new FakeWorker(url)); };
+        const bridge = swBridge(adapter);
+        expect(await attach(bridge)).toMatchObject({ ok: false, code });
+        expect(adapter.browser.closedConnections).toBe(1);
+        expect(await bridge.handle(request("after", "tabs", {}))).toMatchObject({ ok: false, code: "session-lost" });
+      }
+    });
+
+    test("a worker that appears mid-lease after a clear still ends the lease", async () => {
+      configured(); const adapter = new FakeAdapter(); const context = adapter.browser.context;
+      context.registerWorker("https://example.test/sw.js");
+      const bridge = swBridge(adapter);
+      expect(await attach(bridge)).toMatchObject({ ok: true });
+      for (const listener of context.events.get("serviceworker") ?? []) listener(new FakeWorker("https://example.test/sw.js"));
+      expect(await bridge.handle(request("after", "tabs", {}))).toMatchObject({ ok: false, code: "session-lost" });
+      expect(adapter.browser.closedConnections).toBe(1);
+    });
   });
 
   test("does not enumerate, select, observe, or use an unapproved existing tab", async () => {
@@ -1195,6 +1414,30 @@ async function eventually<T>(work: () => T | undefined | Promise<T | undefined>)
       const fills = credentialFields(page, { "input[name=user]": [{ type: "text" }] });
       expect(await bridge.handle(request("default-type", "credential-type", credential(tabId, { field: "username", selector: "input[name=user]" })))).toEqual({ id: "default-type", ok: true, result: {} });
       expect(fills).toHaveLength(1);
+    });
+
+    test("credential operations are unchanged after attach cleared an earlier service worker (sandbar i17)", async () => {
+      configured(); const adapter = new FakeAdapter(); const context = adapter.browser.context;
+      context.registerWorker("https://example.test/sw.js");
+      const bridge = new BrowserBridge(adapter);
+      expect(await leaseAttach(bridge)).toMatchObject({ ok: true });
+      expect(context.workers).toEqual([]);
+      const page = context.page; const tabId = tabIdOf(bridge, page);
+      expect(await bridge.handle(request("origin", "committed-origin", { tabId }))).toEqual({ id: "origin", ok: true, result: { origin: "https://example.test" } });
+      const fills = credentialFields(page, { "#password": [{}] });
+      expect(await bridge.handle(request("fill", "credential-type", credential(tabId)))).toEqual({ id: "fill", ok: true, result: {} });
+      expect(fills).toEqual([{ selector: "#password", value: CANARY }]);
+      // The refusals hold: a mismatched expected origin types nothing, and qa-layout denies both operations.
+      const refused = credentialFields(page, { "#password": [{}] });
+      expect(await bridge.handle(request("wrong", "credential-type", credential(tabId, { expectOrigin: "https://other.test" })))).toEqual({ id: "wrong", ok: false, code: "permission-denied" });
+      expect(refused).toEqual([]);
+      expect(context.detachedSessions).toBe(context.cdpSessions);
+      await bridge.handle(request("detach", "detach", {}));
+      const qaAdapter = new FakeAdapter(); qaAdapter.browser.context.registerWorker("https://example.test/sw.js"); const qaBridge = new BrowserBridge(qaAdapter);
+      expect(await leaseAttach(qaBridge, { inputScope: "qa-layout" })).toMatchObject({ ok: true });
+      const qaTab = tabIdOf(qaBridge, qaAdapter.browser.context.page);
+      expect(await qaBridge.handle(request("qa-origin", "committed-origin", { tabId: qaTab }))).toEqual({ id: "qa-origin", ok: false, code: "permission-denied" });
+      expect(await qaBridge.handle(request("qa-fill", "credential-type", credential(qaTab)))).toEqual({ id: "qa-fill", ok: false, code: "permission-denied" });
     });
 
     test("credential-type needs no allowInput or observation grant but still requires an attachment", async () => {

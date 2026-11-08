@@ -61,10 +61,25 @@ s6-setuidgid abc rm -rf -- \
   "/config/sandbar-browser/Default/Last Session" \
   "/config/sandbar-browser/Default/Last Tabs"
 
+# An operator who signs this seat in to sites that offer passkeys first (Google)
+# can turn WebAuthn off, so the site falls back to a password the seat can type
+# instead of opening a native security-key prompt nobody can see or dismiss.
+# Any value other than on or off fails loud rather than guessing.
+webauthn_flags=()
+case "${SANDBAR_BROWSER_WEBAUTHN:-on}" in
+  on) ;;
+  off) webauthn_flags=(--disable-blink-features=WebAuth) ;;
+  *)
+    printf "%s\n" "SANDBAR_BROWSER_WEBAUTHN must be on or off." >&2
+    exit 1
+    ;;
+esac
+
 exec s6-setuidgid abc env HOME=/config DISPLAY=:1 "$chromium_bin" \
   --user-data-dir=/config/sandbar-browser \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
   --no-first-run \
   --no-default-browser-check \
-  --hide-crash-restore-bubble
+  --hide-crash-restore-bubble \
+  "${webauthn_flags[@]}"

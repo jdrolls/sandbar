@@ -130,6 +130,27 @@ describe("shared-browser seat startup", () => {
     expect(result.log).not.toMatch(/--(?:no-sandbox|disable-[^ ]*sandbox|single-process)/);
   });
 
+  test("keeps WebAuthn on by default and turns it off only on an explicit off", () => {
+    const base = { SANDBAR_SHARED_BROWSER: "1", SANDBAR_BROWSER_SANDBOX: "namespace" };
+    const launch = "chromium --user-data-dir=/config/sandbar-browser --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --no-first-run --no-default-browser-check --hide-crash-restore-bubble";
+
+    const byDefault = runService(base);
+    expect(byDefault.exitCode).toBe(0);
+    expect(byDefault.log).not.toContain("--disable-blink-features");
+
+    const on = runService({ ...base, SANDBAR_BROWSER_WEBAUTHN: "on" });
+    expect(on.exitCode).toBe(0);
+    expect(on.log).not.toContain("--disable-blink-features");
+
+    const off = runService({ ...base, SANDBAR_BROWSER_WEBAUTHN: "off" });
+    expect(off.exitCode).toBe(0);
+    expect(off.log).toContain(launch + " --disable-blink-features=WebAuth\n");
+
+    const bad = runService({ ...base, SANDBAR_BROWSER_WEBAUTHN: "maybe" });
+    expect(bad.exitCode).toBe(1);
+    expect(bad.log).not.toContain("chromium ");
+  });
+
   test("starts every browser with no stored session, removed as abc before launch", () => {
     const result = runService({ SANDBAR_SHARED_BROWSER: "1", SANDBAR_BROWSER_SANDBOX: "namespace" });
     expect(result.exitCode).toBe(0);

@@ -342,7 +342,7 @@ Sites that offer a passkey first (Google) open a native WebAuthn prompt that
 nobody watching the seat can see or dismiss. Set `SANDBAR_BROWSER_WEBAUTHN=off`
 on the seat container and the service adds `--disable-blink-features=WebAuth`,
 which removes `PublicKeyCredential` from every page, so the site falls back to
-a password. The default is `on`; any other value stops the service.
+a password. Unset or empty means `on`; any value other than `on` or `off` stops the service.
 
 No value is left in a selection buffer either. On X11, selecting a filled
 field publishes it as PRIMARY, and a cut (Shift+Delete) puts it in CLIPBOARD;
